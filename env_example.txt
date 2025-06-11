@@ -1,0 +1,17 @@
+# Slack API Tokens
+# Get these from https://api.slack.com/apps
+SOURCE_SLACK_TOKEN=xoxb-your-source-workspace-bot-token
+DEST_SLACK_TOKEN=xoxb-your-destination-workspace-bot-token
+
+# Optional: Workspace names for reference
+SOURCE_WORKSPACE_NAME=Source Company Slack
+DEST_WORKSPACE_NAME=Destination Company Slack
+
+# Migration Settings
+BATCH_SIZE=100
+RATE_LIMIT_DELAY=1.0
+MAX_RETRIES=3
+
+# Output Settings
+OUTPUT_DIR=migration_data
+LOG_LEVEL=INFO
