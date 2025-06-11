@@ -841,38 +841,45 @@ class SlackMigrator:
         logger.warning(f"Timeout waiting for file {filename} to appear in channel after {max_wait_time}s")
         return False
 
-    def _upload_file_to_slack(self, local_file_path: str, channel_id: str,
-                             original_filename: str, file_comment: str = "") -> Optional[Dict[str, Any]]:
+    def _upload_file_for_permalink(self, local_file_path: str, file_info: Dict[str, Any]) -> Optional[str]:
         """
-        Upload a file to Slack channel
-        Returns file info if successful, None otherwise
+        Upload a file without channel parameter to get permalink
+        Returns permalink if successful, None otherwise
         """
         try:
             if not Path(local_file_path).exists():
                 logger.warning(f"Local file not found: {local_file_path}")
                 return None
 
-            logger.debug(f"Uploading file {original_filename} to channel {channel_id}")
+            original_filename = file_info.get("name", "unknown_file")
+            file_title = file_info.get("title", original_filename)
 
-            # Use files.upload method with proper parameters
+            logger.debug(f"Uploading file {original_filename} for permalink")
+
+            # Upload file without channel parameter to prevent immediate publishing
             with open(local_file_path, 'rb') as file_content:
                 response = self.dest_client.client.files_upload_v2(
-                    channel=channel_id,
                     file=file_content,
                     filename=original_filename,
-                    initial_comment=file_comment,
-                    title=original_filename
+                    title=file_title
+                    # Note: No channel parameter - this should keep the file private and get us a permalink
                 )
 
             if response["ok"]:
-                logger.info(f"Successfully uploaded file: {original_filename}")
-                return response["file"]
+                file_obj = response["file"]
+                permalink = file_obj.get("permalink") or file_obj.get("url_private")
+                if permalink:
+                    logger.debug(f"Successfully got permalink for file: {original_filename}")
+                    return permalink
+                else:
+                    logger.warning(f"No permalink in response for file: {original_filename}")
+                    return None
             else:
                 logger.error(f"Failed to upload file {original_filename}: {response.get('error', 'Unknown error')}")
                 return None
 
         except Exception as e:
-            logger.error(f"Error uploading file {original_filename}: {e}")
+            logger.error(f"Error uploading file {original_filename} for permalink: {e}")
             return None
 
     def _format_timestamp_jst(self, slack_timestamp: str) -> str:
@@ -1054,7 +1061,7 @@ class SlackMigrator:
     def _upload_single_message_with_files(self, channel_id: str, message: Dict[str, Any],
                                          users_data: List[Dict[str, Any]], channel_name: str,
                                          thread_mapping: Dict[str, str]) -> Optional[str]:
-        """Upload a single message with its files in proper chronological order"""
+        """Upload a single message with its files using permalink approach"""
         # Skip if message has no text or is a system message
         text = message.get("text", "")
         if not text or message.get("subtype") in ["channel_join", "channel_leave"]:
@@ -1112,52 +1119,48 @@ class SlackMigrator:
 
         posted_ts = None
 
-        # First, post the original text message if there's actual text content
-        if text.strip():
-            try:
-                # Post the message with user info and proper threading/broadcasting
-                response = self.dest_client.post_message(
-                    channel_id=channel_id,
-                    text=formatted_text,
-                    username=username_with_timestamp,
-                    icon_url=user_info["icon_url"],
-                    thread_ts=dest_thread_ts,  # This will be None for main messages, set for thread replies
-                    reply_broadcast=should_broadcast_reply  # Enable broadcast for original thread broadcast messages
-                )
-
-                # Add small delay between messages to avoid rate limits
-                time.sleep(0.5)
-
-                # Add reactions if present in original message
-                if response.get("ok") and response.get("ts"):
-                    posted_ts = response["ts"]
-                    self._add_message_reactions(channel_id, posted_ts, message, channel_name)
-
-            except Exception as e:
-                logger.error(f"Failed to post message: {e}")
-
-        # Immediately after posting the text message, upload any files from this message
+        # Step 1: Upload files without channel parameter to get permalinks
+        file_permalinks = []
         if "files" in message and message["files"]:
             for file_info in message["files"]:
                 local_path = file_info.get("local_path")
                 if local_path and file_info.get("download_status") == "success":
-                    # Upload file to destination without initial comment to let Slack handle the file message
-                    original_name = file_info.get("name", "unknown_file")
+                    if Path(local_path).exists():
+                        # Upload file without channel to get permalink
+                        permalink = self._upload_file_for_permalink(local_path, file_info)
+                        if permalink:
+                            file_title = file_info.get("title") or file_info.get("name", "File")
+                            file_permalinks.append(f"<{permalink}|{file_title}>")
+                            logger.info(f"Got permalink for file {file_info.get('name', 'unknown')}")
 
-                    uploaded_file = self._upload_file_to_slack(
-                        local_path,
-                        channel_id,
-                        original_name,
-                        ""  # No initial comment - let Slack create its own file upload message
-                    )
+        # Step 2: Compose message with file permalinks
+        if file_permalinks:
+            # Add file permalinks to the message text
+            files_text = " ".join(file_permalinks)
+            formatted_text = f"{formatted_text}\n{files_text}"
 
-                    if uploaded_file:
-                        logger.info(f"Uploaded file {original_name} to #{channel_name}")
-                        # Wait 20 seconds for file to be processed and appear in channel
-                        logger.info(f"Waiting 20 seconds for file {original_name} to be processed...")
-                        time.sleep(20.0)
-                    else:
-                        logger.warning(f"Failed to upload file {original_name}")
+        # Post the message with text and file permalinks
+        try:
+            # Post the message with user info and proper threading/broadcasting
+            response = self.dest_client.post_message(
+                channel_id=channel_id,
+                text=formatted_text,
+                username=username_with_timestamp,
+                icon_url=user_info["icon_url"],
+                thread_ts=dest_thread_ts,  # This will be None for main messages, set for thread replies
+                reply_broadcast=should_broadcast_reply  # Enable broadcast for original thread broadcast messages
+            )
+
+            # Add small delay between messages to avoid rate limits
+            time.sleep(0.5)
+
+            # Add reactions if present in original message
+            if response.get("ok") and response.get("ts"):
+                posted_ts = response["ts"]
+                self._add_message_reactions(channel_id, posted_ts, message, channel_name)
+
+        except Exception as e:
+            logger.error(f"Failed to post message: {e}")
 
         return posted_ts
 
