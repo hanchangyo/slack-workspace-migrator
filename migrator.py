@@ -329,7 +329,7 @@ class SlackMigrator:
             return None
 
     def download_workspace_data(self, force: bool = False) -> Dict[str, Any]:
-        """Download all data from source workspace"""
+        """Download all data from source workspace with incremental saving"""
         logger.info("Starting workspace data download...")
 
         data = {
@@ -362,17 +362,13 @@ class SlackMigrator:
                 channel_id = channel["id"]
                 channel_name = channel.get("name", channel_id)
 
-                # Check if messages already downloaded
-                if not force and self._channel_messages_exist(channel_id):
-                    logger.info(f"Messages for #{channel_name} already exist, skipping")
-                    # Load existing data for return value
-                    try:
-                        filename = f"{channel_name}_{channel_id}.json"
-                        with open(messages_dir / filename, "r") as f:
-                            channel_data = json.load(f)
-                            data["messages"][channel_id] = channel_data
-                    except Exception as e:
-                        logger.warning(f"Could not load existing messages for #{channel_name}: {e}")
+                # Load existing data to check completion status
+                existing_data = self._load_existing_channel_data(channel_name, channel_id)
+
+                # Check if download was already completed and we're not forcing
+                if not force and existing_data.get("download_completed", False):
+                    logger.info(f"Channel #{channel_name} already completed, loading from file")
+                    data["messages"][channel_id] = existing_data
                     continue
 
                 # Check if channel is accessible
@@ -383,20 +379,43 @@ class SlackMigrator:
 
                 logger.info(f"Downloading messages from #{channel_name} ({reason})")
 
+                # Determine starting point for download (resume if possible)
+                oldest_timestamp = None
+                if not force and existing_data.get("messages"):
+                    oldest_timestamp = self._get_last_message_timestamp(channel_name, channel_id)
+                    if oldest_timestamp:
+                        logger.info(f"Resuming #{channel_name} from timestamp {oldest_timestamp}")
+
+                # Create progress callback for incremental saving
+                def save_progress(message_batch: List[Dict[str, Any]]):
+                    if message_batch:
+                        self._save_incremental_messages(channel_name, channel_id, message_batch, channel, is_complete=False)
+
                 try:
-                    messages = self.source_client.get_channel_messages(channel_id)
+                    # Download messages with incremental saving
+                    messages = self.source_client.get_channel_messages(
+                        channel_id,
+                        oldest=oldest_timestamp,
+                        progress_callback=save_progress
+                    )
+
+                    # Load all messages we have so far
+                    all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
 
                     # Download files from messages
-                    updated_messages = self._download_channel_files(messages, channel_name)
+                    logger.info(f"Processing files for {len(all_messages)} messages in #{channel_name}...")
+                    updated_messages = self._download_channel_files(all_messages, channel_name)
 
+                    # Final save with file information and completion flag
                     channel_data = {
                         "channel_info": channel,
                         "messages": updated_messages,
                         "download_timestamp": datetime.now().isoformat(),
-                        "files_downloaded": True
+                        "files_downloaded": True,
+                        "download_completed": True
                     }
 
-                    # Save immediately
+                    # Save final version
                     filename = f"{channel_name}_{channel_id}.json"
                     with open(messages_dir / filename, "w") as f:
                         json.dump(channel_data, f, indent=2)
@@ -407,27 +426,116 @@ class SlackMigrator:
                     file_count = sum(len(msg.get("files", [])) for msg in updated_messages)
                     logger.info(f"Downloaded and saved {len(updated_messages)} messages and {file_count} files from #{channel_name}")
 
+                except KeyboardInterrupt:
+                    logger.warning(f"Download interrupted during #{channel_name}. Progress has been saved and can be resumed.")
+                    # Load partial data we have
+                    partial_data = self._load_existing_channel_data(channel_name, channel_id)
+                    if partial_data.get("messages"):
+                        data["messages"][channel_id] = partial_data
+                    # Re-raise to stop the overall download
+                    raise
+
                 except Exception as e:
                     logger.error(f"Failed to download messages from #{channel_name}: {e}")
-                    # Save error info
-                    error_data = {
-                        "channel_info": channel,
-                        "messages": [],
-                        "error": str(e),
-                        "download_timestamp": datetime.now().isoformat(),
-                        "files_downloaded": False
-                    }
-                    filename = f"{channel_name}_{channel_id}.json"
-                    with open(messages_dir / filename, "w") as f:
-                        json.dump(error_data, f, indent=2)
-
-                    data["messages"][channel_id] = error_data
+                    # Load any partial data we have
+                    partial_data = self._load_existing_channel_data(channel_name, channel_id)
+                    if partial_data.get("messages"):
+                        logger.info(f"Saving {len(partial_data['messages'])} partially downloaded messages from #{channel_name}")
+                        partial_data["error"] = str(e)
+                        partial_data["download_timestamp"] = datetime.now().isoformat()
+                        data["messages"][channel_id] = partial_data
+                    else:
+                        # Save error info
+                        error_data = {
+                            "channel_info": channel,
+                            "messages": [],
+                            "error": str(e),
+                            "download_timestamp": datetime.now().isoformat(),
+                            "files_downloaded": False,
+                            "download_completed": False
+                        }
+                        filename = f"{channel_name}_{channel_id}.json"
+                        with open(messages_dir / filename, "w") as f:
+                            json.dump(error_data, f, indent=2)
+                        data["messages"][channel_id] = error_data
 
         logger.info("Workspace data download completed!")
         return data
 
+    def _load_existing_channel_data(self, channel_name: str, channel_id: str) -> Dict[str, Any]:
+        """Load existing channel data if it exists"""
+        messages_dir = self.output_dir / "messages"
+        filename = f"{channel_name}_{channel_id}.json"
+        file_path = messages_dir / filename
+
+        if file_path.exists():
+            try:
+                with open(file_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load existing channel data: {e}")
+
+        return {
+            "channel_info": {},
+            "messages": [],
+            "download_timestamp": None,
+            "files_downloaded": False,
+            "download_completed": False
+        }
+
+    def _save_incremental_messages(self, channel_name: str, channel_id: str, new_messages: List[Dict[str, Any]],
+                                 channel_info: Dict[str, Any], is_complete: bool = False):
+        """Save messages incrementally to avoid data loss on interruption"""
+        messages_dir = self.output_dir / "messages"
+        messages_dir.mkdir(exist_ok=True)
+        filename = f"{channel_name}_{channel_id}.json"
+        file_path = messages_dir / filename
+
+        # Load existing data
+        existing_data = self._load_existing_channel_data(channel_name, channel_id)
+
+        # Update channel info
+        existing_data["channel_info"] = channel_info
+
+        # Append new messages (avoid duplicates by timestamp)
+        existing_messages = existing_data.get("messages", [])
+        existing_timestamps = {msg.get("ts") for msg in existing_messages if msg.get("ts")}
+
+        for message in new_messages:
+            if message.get("ts") not in existing_timestamps:
+                existing_messages.append(message)
+                existing_timestamps.add(message.get("ts"))
+
+        # Sort messages by timestamp (oldest first)
+        existing_messages.sort(key=lambda x: float(x.get("ts", 0)))
+
+        # Update the data
+        existing_data["messages"] = existing_messages
+        existing_data["last_update_timestamp"] = datetime.now().isoformat()
+        existing_data["download_completed"] = is_complete
+
+        # Save to file
+        try:
+            with open(file_path, "w") as f:
+                json.dump(existing_data, f, indent=2)
+            logger.debug(f"Saved {len(new_messages)} new messages to {filename} (total: {len(existing_messages)})")
+        except Exception as e:
+            logger.error(f"Failed to save incremental messages: {e}")
+
+    def _get_last_message_timestamp(self, channel_name: str, channel_id: str) -> Optional[str]:
+        """Get the timestamp of the last downloaded message for resuming"""
+        existing_data = self._load_existing_channel_data(channel_name, channel_id)
+        messages = existing_data.get("messages", [])
+
+        if messages:
+            # Messages should be sorted by timestamp, get the newest one
+            latest_message = max(messages, key=lambda x: float(x.get("ts", 0)))
+            return latest_message.get("ts")
+
+        return None
+
     def download_single_channel(self, channel_name: str, force: bool = False) -> Optional[Dict[str, Any]]:
-        """Download data from a single channel by name"""
+        """Download data from a single channel by name with incremental saving"""
         logger.info(f"Starting single channel download for #{channel_name}...")
 
         # Ensure workspace info and users are downloaded first
@@ -475,28 +583,22 @@ class SlackMigrator:
                     logger.error(f"Failed to join #{channel_name}: {e}")
                     return None
 
-        # Check if messages already downloaded
-        if not force and self._channel_messages_exist(channel_id):
-            logger.info(f"Messages for #{channel_name} already exist, loading from file")
-            messages_dir = self.output_dir / "messages"
-            filename = f"{channel_name}_{channel_id}.json"
-            try:
-                with open(messages_dir / filename, "r") as f:
-                    channel_data = json.load(f)
+        # Load existing data to check what we already have
+        existing_data = self._load_existing_channel_data(channel_name, channel_id)
 
-                    # Count files in cached data
-                    messages = channel_data.get("messages", [])
-                    file_count = sum(len(msg.get("files", [])) for msg in messages)
+        # Check if download was already completed and we're not forcing
+        if not force and existing_data.get("download_completed", False):
+            logger.info(f"Channel #{channel_name} download already completed, loading from file")
+            messages = existing_data.get("messages", [])
+            file_count = sum(len(msg.get("files", [])) for msg in messages)
 
-                    return {
-                        "channel_info": target_channel,
-                        "messages": messages,
-                        "total_users": len(users),
-                        "file_count": file_count,
-                        "from_cache": True
-                    }
-            except Exception as e:
-                logger.warning(f"Could not load cached data: {e}")
+            return {
+                "channel_info": target_channel,
+                "messages": messages,
+                "total_users": len(users),
+                "file_count": file_count,
+                "from_cache": True
+            }
 
         # Check if channel is accessible
         is_accessible, reason = self._is_channel_accessible(target_channel)
@@ -506,22 +608,43 @@ class SlackMigrator:
 
         logger.info(f"Channel #{channel_name} is accessible: {reason}")
 
-        # Download messages for the target channel
+        # Determine starting point for download
+        oldest_timestamp = None
+        if not force and existing_data.get("messages"):
+            oldest_timestamp = self._get_last_message_timestamp(channel_name, channel_id)
+            if oldest_timestamp:
+                logger.info(f"Resuming download from timestamp {oldest_timestamp}")
+
+        # Create progress callback for incremental saving
+        def save_progress(message_batch: List[Dict[str, Any]]):
+            if message_batch:
+                self._save_incremental_messages(channel_name, channel_id, message_batch, target_channel, is_complete=False)
+
+        # Download messages for the target channel with incremental saving
         logger.info(f"Downloading messages from #{channel_name}...")
         try:
-            messages = self.source_client.get_channel_messages(channel_id)
+            messages = self.source_client.get_channel_messages(
+                channel_id,
+                oldest=oldest_timestamp,
+                progress_callback=save_progress
+            )
+
+            # Mark download as complete
+            all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
 
             # Download files from messages
-            updated_messages = self._download_channel_files(messages, channel_name)
+            logger.info(f"Processing files for {len(all_messages)} messages...")
+            updated_messages = self._download_channel_files(all_messages, channel_name)
 
+            # Final save with file information and completion flag
             channel_data = {
                 "channel_info": target_channel,
                 "messages": updated_messages,
                 "download_timestamp": datetime.now().isoformat(),
-                "files_downloaded": True
+                "files_downloaded": True,
+                "download_completed": True
             }
 
-            # Save data
             messages_dir = self.output_dir / "messages"
             messages_dir.mkdir(exist_ok=True)
             filename = f"{channel_name}_{channel_id}.json"
@@ -540,8 +663,35 @@ class SlackMigrator:
                 "from_cache": False
             }
 
+        except KeyboardInterrupt:
+            logger.info(f"Download interrupted by user. Progress has been saved and can be resumed.")
+            # Load what we have so far
+            partial_data = self._load_existing_channel_data(channel_name, channel_id)
+            messages = partial_data.get("messages", [])
+            file_count = sum(len(msg.get("files", [])) for msg in messages)
+
+            return {
+                "channel_info": target_channel,
+                "messages": messages,
+                "total_users": len(users),
+                "file_count": file_count,
+                "from_cache": False,
+                "partial_download": True
+            }
         except Exception as e:
             logger.error(f"Failed to download messages from #{channel_name}: {e}")
+            # Still return partial data if we have any
+            partial_data = self._load_existing_channel_data(channel_name, channel_id)
+            if partial_data.get("messages"):
+                logger.info(f"Returning {len(partial_data['messages'])} partially downloaded messages")
+                return {
+                    "channel_info": target_channel,
+                    "messages": partial_data["messages"],
+                    "total_users": len(users),
+                    "file_count": 0,
+                    "from_cache": False,
+                    "partial_download": True
+                }
             return None
 
     def _save_data(self, data: Dict[str, Any]):

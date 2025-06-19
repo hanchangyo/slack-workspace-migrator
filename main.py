@@ -50,8 +50,17 @@ def download(ctx, channel, force):
             data = migrator.download_single_channel(channel, force=force)
             if data:
                 from_cache = data.get('from_cache', False)
-                status_icon = "📁" if from_cache else "✅"
-                source_text = "from cache" if from_cache else "downloaded"
+                partial_download = data.get('partial_download', False)
+
+                if partial_download:
+                    status_icon = "⚠️"
+                    source_text = "partially downloaded (interrupted)"
+                elif from_cache:
+                    status_icon = "📁"
+                    source_text = "from cache"
+                else:
+                    status_icon = "✅"
+                    source_text = "downloaded"
 
                 click.echo(f"{status_icon} Channel #{channel} data {source_text}!")
                 click.echo(f"   - Channel: #{channel}")
@@ -61,9 +70,14 @@ def download(ctx, channel, force):
 
                 if from_cache:
                     click.echo("   ℹ️  Data loaded from existing files (use --force to re-download)")
+                elif partial_download:
+                    click.echo("   ⚠️  Download was interrupted. Run again to resume from where it left off.")
             else:
                 click.echo(f"❌ Channel #{channel} not found or could not be accessed")
                 ctx.exit(1)
+        except KeyboardInterrupt:
+            click.echo("\n⚠️  Download interrupted by user. Progress has been saved.")
+            click.echo("   Run the command again to resume from where it left off.")
         except Exception as e:
             click.echo(f"❌ Download failed: {e}")
             ctx.exit(1)
@@ -78,16 +92,28 @@ def download(ctx, channel, force):
             channels_count = len(data.get('channels', []))
             messages_count = len(data.get('messages', {}))
 
-            # Count total files across all channels
+            # Count total files across all channels and check for partial downloads
             total_files = 0
+            completed_channels = 0
+            partial_channels = 0
+
             for channel_data in data.get('messages', {}).values():
                 messages = channel_data.get('messages', [])
                 for message in messages:
                     total_files += len(message.get('files', []))
 
+                # Check if channel download was completed
+                if channel_data.get('download_completed', False):
+                    completed_channels += 1
+                elif messages:  # Has some messages but not completed
+                    partial_channels += 1
+
             click.echo(f"   - Users: {users_count}")
             click.echo(f"   - Channels: {channels_count}")
             click.echo(f"   - Message channels processed: {messages_count}")
+            click.echo(f"   - Completed channels: {completed_channels}")
+            if partial_channels > 0:
+                click.echo(f"   - Partial channels: {partial_channels} (can be resumed)")
             click.echo(f"   - Files downloaded: {total_files}")
 
             # Show breakdown of what was skipped vs downloaded
@@ -105,6 +131,9 @@ def download(ctx, channel, force):
                     if channels_exists:
                         click.echo("   - Channels")
 
+        except KeyboardInterrupt:
+            click.echo("\n⚠️  Download interrupted by user. Progress has been saved.")
+            click.echo("   Run the command again to resume from where it left off.")
         except Exception as e:
             click.echo(f"❌ Download failed: {e}")
             ctx.exit(1)
@@ -398,6 +427,119 @@ def status(ctx):
             click.echo("📁 Files directory exists but is empty")
     else:
         click.echo("❌ Files")
+
+@cli.command()
+@click.option('--channel', help='Show count for only a specific channel (by name)')
+@click.pass_context
+def count(ctx, channel):
+    """Show estimated message counts for channels"""
+    migrator = ctx.obj['migrator']
+
+    if channel:
+        click.echo(f"Getting message count for channel #{channel}...")
+        try:
+            # Get all channels to find the target channel
+            all_channels = migrator.source_client.get_channels()
+            target_channel = None
+            for ch in all_channels:
+                if ch.get("name") == channel:
+                    target_channel = ch
+                    break
+
+            if not target_channel:
+                click.echo(f"❌ Channel #{channel} not found")
+                ctx.exit(1)
+
+            channel_id = target_channel["id"]
+            is_private = target_channel.get("is_private", False)
+            is_member = target_channel.get("is_member", False)
+
+            if is_private and not is_member:
+                click.echo(f"⚠️  Channel #{channel} is private and bot is not a member")
+                ctx.exit(1)
+
+            # Try to estimate message count
+            estimated_count = migrator.source_client.get_channel_message_count_estimate(channel_id)
+
+            if estimated_count is not None:
+                click.echo(f"📊 Channel #{channel}:")
+                click.echo(f"   - Estimated messages: {estimated_count:,}")
+                click.echo(f"   - Type: {'Private' if is_private else 'Public'}")
+                click.echo(f"   - Bot access: {'Yes' if is_member else 'No'}")
+            else:
+                click.echo(f"📊 Channel #{channel}:")
+                click.echo(f"   - Estimated messages: Unable to determine")
+                click.echo(f"   - Type: {'Private' if is_private else 'Public'}")
+                click.echo(f"   - Bot access: {'Yes' if is_member else 'No'}")
+                click.echo(f"   ℹ️  To get exact count, download the channel")
+
+        except Exception as e:
+            click.echo(f"❌ Error getting count for #{channel}: {e}")
+            ctx.exit(1)
+    else:
+        click.echo("Getting estimated message counts for all channels...")
+        try:
+            channels_with_estimates = migrator.source_client.get_channels_with_message_estimates()
+
+            # Separate channels by type and access
+            accessible_channels = []
+            inaccessible_channels = []
+
+            for ch in channels_with_estimates:
+                channel_name = ch.get("name", ch["id"])
+                is_private = ch.get("is_private", False)
+                is_member = ch.get("is_member", False)
+                is_archived = ch.get("is_archived", False)
+
+                if is_archived:
+                    continue  # Skip archived channels
+
+                if is_private and not is_member:
+                    inaccessible_channels.append(ch)
+                else:
+                    accessible_channels.append(ch)
+
+            # Show accessible channels with counts
+            if accessible_channels:
+                click.echo(f"\n📊 Accessible Channels ({len(accessible_channels)}):")
+                click.echo("=" * 60)
+
+                total_estimated = 0
+                channels_with_estimates_count = 0
+
+                for ch in accessible_channels:
+                    channel_name = ch.get("name", ch["id"])
+                    is_private = ch.get("is_private", False)
+                    estimated_count = ch.get("estimated_message_count")
+
+                    type_indicator = "🔒" if is_private else "📢"
+
+                    if estimated_count is not None:
+                        click.echo(f"   {type_indicator} #{channel_name:<20} ~{estimated_count:>6,} messages")
+                        total_estimated += estimated_count
+                        channels_with_estimates_count += 1
+                    else:
+                        click.echo(f"   {type_indicator} #{channel_name:<20} {'Unknown':>10}")
+
+                if channels_with_estimates_count > 0:
+                    click.echo("=" * 60)
+                    click.echo(f"   📈 Total estimated (known): ~{total_estimated:,} messages")
+                    click.echo(f"   📋 Channels with estimates: {channels_with_estimates_count}/{len(accessible_channels)}")
+
+            # Show inaccessible channels
+            if inaccessible_channels:
+                click.echo(f"\n🔒 Inaccessible Private Channels ({len(inaccessible_channels)}):")
+                click.echo("=" * 60)
+                for ch in inaccessible_channels:
+                    channel_name = ch.get("name", ch["id"])
+                    click.echo(f"   🔒 #{channel_name:<20} {'Requires invite':>15}")
+
+            if not accessible_channels and not inaccessible_channels:
+                click.echo("No channels found or all channels are archived")
+
+        except Exception as e:
+            click.echo(f"❌ Error getting channel counts: {e}")
+            ctx.exit(1)
 
 if __name__ == '__main__':
     cli()

@@ -1,6 +1,6 @@
 import time
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from tqdm import tqdm
@@ -113,8 +113,16 @@ class SlackClient:
 
         return users
 
-    def get_channel_messages(self, channel_id: str, oldest: Optional[str] = None, include_thread_replies: bool = True) -> List[Dict[str, Any]]:
-        """Get all messages from a channel, optionally including thread replies"""
+    def get_channel_messages(self, channel_id: str, oldest: Optional[str] = None, include_thread_replies: bool = True,
+                           progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
+        """Get all messages from a channel, optionally including thread replies
+
+        Args:
+            channel_id: Channel ID to fetch messages from
+            oldest: Oldest timestamp to fetch messages from
+            include_thread_replies: Whether to include thread replies
+            progress_callback: Optional callback function(messages_batch) called after each batch is fetched
+        """
         messages = []
         cursor = None
 
@@ -133,6 +141,13 @@ class SlackClient:
                 batch_messages = response["messages"]
                 messages.extend(batch_messages)
                 pbar.update(len(batch_messages))
+
+                # Call progress callback if provided
+                if progress_callback and batch_messages:
+                    try:
+                        progress_callback(batch_messages)
+                    except Exception as e:
+                        logger.warning(f"Progress callback failed: {e}")
 
                 cursor = response.get("response_metadata", {}).get("next_cursor")
                 if not cursor:
@@ -155,6 +170,13 @@ class SlackClient:
                         thread_replies = self.get_thread_replies(channel_id, thread_ts)
                         # Add thread replies after the parent message
                         messages_with_replies.extend(thread_replies)
+
+                        # Call progress callback for thread replies too
+                        if progress_callback and thread_replies:
+                            try:
+                                progress_callback(thread_replies)
+                            except Exception as e:
+                                logger.warning(f"Progress callback failed for thread replies: {e}")
 
             if thread_count > 0:
                 logger.info(f"Downloaded replies from {thread_count} threads")
