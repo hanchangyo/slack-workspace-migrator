@@ -154,7 +154,8 @@ class SlackClient:
         return users
 
     def get_channel_messages(self, channel_id: str, oldest: Optional[str] = None, include_thread_replies: bool = True,
-                           progress_callback: Optional[Callable] = None) -> List[Dict[str, Any]]:
+                           progress_callback: Optional[Callable] = None, ts_progress_bar: Optional = None,
+                           ts_now: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get all messages from a channel, optionally including thread replies
 
         Args:
@@ -162,11 +163,21 @@ class SlackClient:
             oldest: Oldest timestamp to fetch messages from
             include_thread_replies: Whether to include thread replies
             progress_callback: Optional callback function(messages_batch) called after each batch is fetched
+            ts_progress_bar: Optional tqdm progress bar for time-based progress tracking
+            ts_now: Current timestamp for time-based progress calculation
         """
         messages = []
         cursor = None
 
-        with tqdm(desc=f"Fetching messages from {channel_id}") as pbar:
+        # Use time-based progress bar if provided, otherwise use simple message count bar
+        if ts_progress_bar is not None and ts_now is not None:
+            pbar = ts_progress_bar
+            use_time_progress = True
+        else:
+            pbar = tqdm(desc=f"Fetching messages from {channel_id}")
+            use_time_progress = False
+
+        try:
             while True:
                 kwargs = {
                     "channel": channel_id,
@@ -180,7 +191,15 @@ class SlackClient:
 
                 batch_messages = response["messages"]
                 messages.extend(batch_messages)
-                pbar.update(len(batch_messages))
+
+                # Update progress bar
+                if use_time_progress and batch_messages:
+                    # For time-based progress, update based on oldest message timestamp in batch
+                    oldest_msg_ts = float(batch_messages[-1]["ts"])
+                    progress_so_far = ts_now - oldest_msg_ts
+                    pbar.update(int(progress_so_far - pbar.n))
+                else:
+                    pbar.update(len(batch_messages))
 
                 # Call progress callback if provided
                 if progress_callback and batch_messages:
@@ -192,6 +211,11 @@ class SlackClient:
                 cursor = response.get("response_metadata", {}).get("next_cursor")
                 if not cursor:
                     break
+
+        finally:
+            # Only close the progress bar if we created it (not time-based)
+            if not use_time_progress:
+                pbar.close()
 
         # If requested, fetch thread replies for messages that have them
         if include_thread_replies:

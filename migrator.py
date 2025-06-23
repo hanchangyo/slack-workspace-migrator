@@ -352,114 +352,93 @@ class SlackMigrator:
         if channels:
             data["channels"] = channels
 
-        # Download messages for each channel
-        if channels:
-            logger.info("Downloading messages and files...")
-            messages_dir = self.output_dir / "messages"
-            messages_dir.mkdir(exist_ok=True)
+        # Download messages from all channels with time-based progress
+        logger.info("Downloading messages from all channels...")
+        accessible_channels = []
 
-            for channel in tqdm(channels, desc="Processing channels"):
+        for channel in channels:
+            is_accessible, reason = self._is_channel_accessible(channel)
+            if is_accessible:
+                accessible_channels.append(channel)
+            else:
+                logger.info(f"Skipping #{channel.get('name', 'unknown')}: {reason}")
+
+        if accessible_channels:
+            # Calculate time ranges for progress bars
+            ts_now = int(time.time())
+            channels_with_time = []
+
+            for channel in accessible_channels:
+                created_time = channel.get("created", ts_now)
+                time_to_rest = ts_now - created_time
+                channels_with_time.append({
+                    "channel": channel,
+                    "time_to_rest": time_to_rest
+                })
+
+            # Download each channel with time-based progress
+            for i, channel_data in enumerate(channels_with_time):
+                channel = channel_data["channel"]
+                time_to_rest = channel_data["time_to_rest"]
+
+                channel_name = channel.get("name", "unknown")
                 channel_id = channel["id"]
-                channel_name = channel.get("name", channel_id)
 
-                # Load existing data to check completion status
-                existing_data = self._load_existing_channel_data(channel_name, channel_id)
+                print(f"{i+1}/{len(channels_with_time)}: {channel_name}")
 
-                # Check if download was already completed and we're not forcing
-                if not force and existing_data.get("download_completed", False):
-                    logger.info(f"Channel #{channel_name} already completed, loading from file")
-                    data["messages"][channel_id] = existing_data
-                    continue
-
-                # Check if channel is accessible
-                is_accessible, reason = self._is_channel_accessible(channel)
-                if not is_accessible:
-                    logger.warning(f"Skipping #{channel_name}: {reason}")
-                    continue
-
-                logger.info(f"Downloading messages from #{channel_name} ({reason})")
-
-                # Determine starting point for download (resume if possible)
-                oldest_timestamp = None
-                if not force and existing_data.get("messages"):
-                    oldest_timestamp = self._get_last_message_timestamp(channel_name, channel_id)
-                    if oldest_timestamp:
-                        logger.info(f"Resuming #{channel_name} from timestamp {oldest_timestamp}")
-
-                # Create progress callback for incremental saving
-                def save_progress(message_batch: List[Dict[str, Any]]):
-                    if message_batch:
-                        self._save_incremental_messages(channel_name, channel_id, message_batch, channel, is_complete=False)
+                # Create time-based progress bar
+                pbar = tqdm(total=time_to_rest, desc=f"#{channel_name}")
 
                 try:
-                    # Download messages with incremental saving
+                    # Create progress callback for incremental saving
+                    def save_progress(message_batch: List[Dict[str, Any]]):
+                        if message_batch:
+                            self._save_incremental_messages(channel_name, channel_id, message_batch, channel, is_complete=False)
+
+                    # Download messages with time-based progress
                     messages = self.source_client.get_channel_messages(
                         channel_id,
-                        oldest=oldest_timestamp,
-                        progress_callback=save_progress
+                        include_thread_replies=True,
+                        progress_callback=save_progress,
+                        ts_progress_bar=pbar,
+                        ts_now=ts_now
                     )
 
-                    # Load all messages we have so far
-                    all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
+                    # Ensure progress bar reaches 100%
+                    pbar.update(time_to_rest - pbar.n)
 
-                    # Download files from messages
-                    logger.info(f"Processing files for {len(all_messages)} messages in #{channel_name}...")
-                    updated_messages = self._download_channel_files(all_messages, channel_name)
+                    # Process files
+                    logger.info(f"Processing files for #{channel_name}...")
+                    updated_messages = self._download_channel_files(messages, channel_name)
 
-                    # Final save with file information and completion flag
-                    channel_data = {
+                    # Final save with completion flag
+                    final_save_data = {
                         "channel_info": channel,
                         "messages": updated_messages,
                         "download_timestamp": datetime.now().isoformat(),
                         "files_downloaded": True,
                         "download_completed": True
                     }
+                    self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
 
-                    # Save final version
-                    filename = f"{channel_name}_{channel_id}.json"
-                    with open(messages_dir / filename, "w") as f:
-                        json.dump(channel_data, f, indent=2)
-
-                    data["messages"][channel_id] = channel_data
-
-                    # Count files
-                    file_count = sum(len(msg.get("files", [])) for msg in updated_messages)
-                    logger.info(f"Downloaded and saved {len(updated_messages)} messages and {file_count} files from #{channel_name}")
-
-                except KeyboardInterrupt:
-                    logger.warning(f"Download interrupted during #{channel_name}. Progress has been saved and can be resumed.")
-                    # Load partial data we have
-                    partial_data = self._load_existing_channel_data(channel_name, channel_id)
-                    if partial_data.get("messages"):
-                        data["messages"][channel_id] = partial_data
-                    # Re-raise to stop the overall download
-                    raise
+                    data["messages"][channel_id] = final_save_data
+                    logger.info(f"✅ Completed #{channel_name}: {len(updated_messages)} messages")
 
                 except Exception as e:
-                    logger.error(f"Failed to download messages from #{channel_name}: {e}")
-                    # Load any partial data we have
-                    partial_data = self._load_existing_channel_data(channel_name, channel_id)
-                    if partial_data.get("messages"):
-                        logger.info(f"Saving {len(partial_data['messages'])} partially downloaded messages from #{channel_name}")
-                        partial_data["error"] = str(e)
-                        partial_data["download_timestamp"] = datetime.now().isoformat()
-                        data["messages"][channel_id] = partial_data
-                    else:
-                        # Save error info
-                        error_data = {
-                            "channel_info": channel,
-                            "messages": [],
-                            "error": str(e),
-                            "download_timestamp": datetime.now().isoformat(),
-                            "files_downloaded": False,
+                    logger.error(f"❌ Failed to download #{channel_name}: {e}")
+                    # Mark partial completion
+                    existing_data = self._load_existing_channel_data(channel_name, channel_id)
+                    if existing_data.get("messages"):
+                        data["messages"][channel_id] = {
+                            **existing_data,
+                            "partial_download": True,
                             "download_completed": False
                         }
-                        filename = f"{channel_name}_{channel_id}.json"
-                        with open(messages_dir / filename, "w") as f:
-                            json.dump(error_data, f, indent=2)
-                        data["messages"][channel_id] = error_data
+                finally:
+                    pbar.close()
+                    time.sleep(1)  # Brief pause between channels
 
-        logger.info("Workspace data download completed!")
+        logger.info("Workspace download completed")
         return data
 
     def _load_existing_channel_data(self, channel_name: str, channel_id: str) -> Dict[str, Any]:
@@ -623,82 +602,117 @@ class SlackMigrator:
         # Download messages for the target channel with incremental saving
         logger.info(f"Downloading messages from #{channel_name}...")
         try:
-            messages = self.source_client.get_channel_messages(
-                channel_id,
-                oldest=oldest_timestamp,
-                progress_callback=save_progress
-            )
+            # Calculate time range for progress bar
+            ts_now = int(time.time())
+            created_time = target_channel.get("created", ts_now)
+            time_to_rest = ts_now - created_time
 
-            # Mark download as complete
-            all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
+            # Create time-based progress bar
+            pbar = tqdm(total=time_to_rest, desc=f"#{channel_name}")
 
-            # Download files from messages
-            logger.info(f"Processing files for {len(all_messages)} messages...")
-            updated_messages = self._download_channel_files(all_messages, channel_name)
+            try:
+                messages = self.source_client.get_channel_messages(
+                    channel_id,
+                    oldest=oldest_timestamp,
+                    progress_callback=save_progress,
+                    ts_progress_bar=pbar,
+                    ts_now=ts_now
+                )
 
-            # Final save with file information and completion flag
-            final_save_data = {
-                "channel_info": target_channel,
-                "messages": updated_messages,
-                "download_timestamp": datetime.now().isoformat(),
-                "files_downloaded": True,
-                "download_completed": True,
-                "from_cache": False,
-                "partial_download": False
-            }
-            self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+                # Ensure progress bar reaches 100%
+                pbar.update(time_to_rest - pbar.n)
 
-            logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name}")
+                # Mark download as complete
+                all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
 
-            return final_save_data
+                # Download files from messages
+                logger.info(f"Processing files for {len(all_messages)} messages...")
+                updated_messages = self._download_channel_files(all_messages, channel_name)
 
-        except SlackApiError as e:
-            error_code = e.response.get("error", "unknown_error")
+                # Final save with file information and completion flag
+                final_save_data = {
+                    "channel_info": target_channel,
+                    "messages": updated_messages,
+                    "download_timestamp": datetime.now().isoformat(),
+                    "files_downloaded": True,
+                    "download_completed": True,
+                    "from_cache": False,
+                    "partial_download": False
+                }
+                self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
 
-            if error_code == "not_in_channel":
-                # Try to handle the not_in_channel error
-                if self._handle_not_in_channel_error(target_channel):
-                    logger.info(f"🔄 Retrying download after joining #{channel_name}...")
-                    # Retry the download after joining
-                    try:
-                        messages = self.source_client.get_channel_messages(
-                            channel_id,
-                            oldest=oldest_timestamp,
-                            progress_callback=save_progress
-                        )
+                logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name}")
 
-                        all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
-                        updated_messages = self._download_channel_files(all_messages, channel_name)
+                return final_save_data
 
-                        final_save_data = {
-                            "channel_info": target_channel,
-                            "messages": updated_messages,
-                            "download_timestamp": datetime.now().isoformat(),
-                            "files_downloaded": True,
-                            "download_completed": True,
-                            "from_cache": False,
-                            "partial_download": False
-                        }
-                        self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+            except SlackApiError as e:
+                error_code = e.response.get("error", "unknown_error")
 
-                        logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name} after auto-join")
-                        return final_save_data
+                if error_code == "not_in_channel":
+                    # Try to handle the not_in_channel error
+                    if self._handle_not_in_channel_error(target_channel):
+                        logger.info(f"🔄 Retrying download after joining #{channel_name}...")
+                        # Retry the download after joining
+                        try:
+                            # Calculate time range for retry progress bar
+                            ts_now = int(time.time())
+                            created_time = target_channel.get("created", ts_now)
+                            time_to_rest = ts_now - created_time
 
-                    except Exception as retry_e:
-                        logger.error(f"❌ Retry failed for #{channel_name}: {retry_e}")
+                            # Create new progress bar for retry
+                            retry_pbar = tqdm(total=time_to_rest, desc=f"#{channel_name} (retry)")
+
+                            try:
+                                messages = self.source_client.get_channel_messages(
+                                    channel_id,
+                                    oldest=oldest_timestamp,
+                                    progress_callback=save_progress,
+                                    ts_progress_bar=retry_pbar,
+                                    ts_now=ts_now
+                                )
+
+                                # Ensure progress bar reaches 100%
+                                retry_pbar.update(time_to_rest - retry_pbar.n)
+
+                                all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
+                                updated_messages = self._download_channel_files(all_messages, channel_name)
+
+                                final_save_data = {
+                                    "channel_info": target_channel,
+                                    "messages": updated_messages,
+                                    "download_timestamp": datetime.now().isoformat(),
+                                    "files_downloaded": True,
+                                    "download_completed": True,
+                                    "from_cache": False,
+                                    "partial_download": False
+                                }
+                                self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+
+                                logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name} after auto-join")
+                                return final_save_data
+                            finally:
+                                retry_pbar.close()
+
+                        except Exception as retry_e:
+                            logger.error(f"❌ Retry failed for #{channel_name}: {retry_e}")
+                            self.diagnose_channel_access(channel_name)
+                            raise
+                    else:
+                        logger.error(f"❌ Cannot resolve access issue for #{channel_name}")
                         self.diagnose_channel_access(channel_name)
                         raise
                 else:
-                    logger.error(f"❌ Cannot resolve access issue for #{channel_name}")
+                    logger.error(f"❌ API error downloading #{channel_name}: {error_code}")
                     self.diagnose_channel_access(channel_name)
                     raise
-            else:
-                logger.error(f"❌ API error downloading #{channel_name}: {error_code}")
+
+            except Exception as e:
+                logger.error(f"❌ Unexpected error downloading #{channel_name}: {e}")
                 self.diagnose_channel_access(channel_name)
                 raise
 
         except Exception as e:
-            logger.error(f"❌ Unexpected error downloading #{channel_name}: {e}")
+            logger.error(f"❌ Exception downloading #{channel_name}: {e}")
             self.diagnose_channel_access(channel_name)
             raise
 
