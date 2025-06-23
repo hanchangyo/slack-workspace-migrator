@@ -637,62 +637,70 @@ class SlackMigrator:
             updated_messages = self._download_channel_files(all_messages, channel_name)
 
             # Final save with file information and completion flag
-            channel_data = {
+            final_save_data = {
                 "channel_info": target_channel,
                 "messages": updated_messages,
                 "download_timestamp": datetime.now().isoformat(),
                 "files_downloaded": True,
-                "download_completed": True
-            }
-
-            messages_dir = self.output_dir / "messages"
-            messages_dir.mkdir(exist_ok=True)
-            filename = f"{channel_name}_{channel_id}.json"
-            with open(messages_dir / filename, "w") as f:
-                json.dump(channel_data, f, indent=2)
-
-            # Count files
-            file_count = sum(len(msg.get("files", [])) for msg in updated_messages)
-            logger.info(f"Downloaded and saved {len(updated_messages)} messages and {file_count} files from #{channel_name}")
-
-            return {
-                "channel_info": target_channel,
-                "messages": updated_messages,
-                "total_users": len(users),
-                "file_count": file_count,
-                "from_cache": False
-            }
-
-        except KeyboardInterrupt:
-            logger.info(f"Download interrupted by user. Progress has been saved and can be resumed.")
-            # Load what we have so far
-            partial_data = self._load_existing_channel_data(channel_name, channel_id)
-            messages = partial_data.get("messages", [])
-            file_count = sum(len(msg.get("files", [])) for msg in messages)
-
-            return {
-                "channel_info": target_channel,
-                "messages": messages,
-                "total_users": len(users),
-                "file_count": file_count,
+                "download_completed": True,
                 "from_cache": False,
-                "partial_download": True
+                "partial_download": False
             }
+            self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+
+            logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name}")
+
+            return final_save_data
+
+        except SlackApiError as e:
+            error_code = e.response.get("error", "unknown_error")
+
+            if error_code == "not_in_channel":
+                # Try to handle the not_in_channel error
+                if self._handle_not_in_channel_error(target_channel):
+                    logger.info(f"🔄 Retrying download after joining #{channel_name}...")
+                    # Retry the download after joining
+                    try:
+                        messages = self.source_client.get_channel_messages(
+                            channel_id,
+                            oldest=oldest_timestamp,
+                            progress_callback=save_progress
+                        )
+
+                        all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
+                        updated_messages = self._download_channel_files(all_messages, channel_name)
+
+                        final_save_data = {
+                            "channel_info": target_channel,
+                            "messages": updated_messages,
+                            "download_timestamp": datetime.now().isoformat(),
+                            "files_downloaded": True,
+                            "download_completed": True,
+                            "from_cache": False,
+                            "partial_download": False
+                        }
+                        self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+
+                        logger.info(f"✅ Successfully downloaded {len(updated_messages)} messages from #{channel_name} after auto-join")
+                        return final_save_data
+
+                    except Exception as retry_e:
+                        logger.error(f"❌ Retry failed for #{channel_name}: {retry_e}")
+                        self.diagnose_channel_access(channel_name)
+                        raise
+                else:
+                    logger.error(f"❌ Cannot resolve access issue for #{channel_name}")
+                    self.diagnose_channel_access(channel_name)
+                    raise
+            else:
+                logger.error(f"❌ API error downloading #{channel_name}: {error_code}")
+                self.diagnose_channel_access(channel_name)
+                raise
+
         except Exception as e:
-            logger.error(f"Failed to download messages from #{channel_name}: {e}")
-            # Still return partial data if we have any
-            partial_data = self._load_existing_channel_data(channel_name, channel_id)
-            if partial_data.get("messages"):
-                logger.info(f"Returning {len(partial_data['messages'])} partially downloaded messages")
-                return {
-                    "channel_info": target_channel,
-                    "messages": partial_data["messages"],
-                    "total_users": len(users),
-                    "file_count": 0,
-                    "from_cache": False,
-                    "partial_download": True
-                }
-            return None
+            logger.error(f"❌ Unexpected error downloading #{channel_name}: {e}")
+            self.diagnose_channel_access(channel_name)
+            raise
 
     def _save_data(self, data: Dict[str, Any]):
         """Save downloaded data to JSON files (legacy method for compatibility)"""
@@ -1368,6 +1376,158 @@ class SlackMigrator:
             else:
                 logger.debug(f"Added {successful_reactions} reactions, skipped {skipped_reactions} reactions for message in #{channel_name}")
 
+    def _test_channel_access(self, channel: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Test comprehensive access to a channel and return detailed diagnostic information
+        """
+        channel_id = channel["id"]
+        channel_name = channel.get("name", channel_id)
+        is_private = channel.get("is_private", False)
+        is_member = channel.get("is_member", False)
+
+        diagnostic = {
+            "channel_name": channel_name,
+            "channel_id": channel_id,
+            "is_private": is_private,
+            "is_member": is_member,
+            "tests": {},
+            "success": False,
+            "error_details": None
+        }
+
+        # Test 1: Basic channel info access
+        try:
+            info_response = self.source_client.get_channel_info(channel_id)
+            diagnostic["tests"]["channel_info"] = {
+                "success": True,
+                "details": "Successfully retrieved channel information"
+            }
+        except Exception as e:
+            diagnostic["tests"]["channel_info"] = {
+                "success": False,
+                "error": str(e),
+                "details": "Failed to retrieve channel information"
+            }
+
+        # Test 2: Message history access (try to fetch just 1 message)
+        try:
+            response = self.source_client._make_request(
+                "conversations_history",
+                channel=channel_id,
+                limit=1
+            )
+            message_count = len(response.get("messages", []))
+            diagnostic["tests"]["message_access"] = {
+                "success": True,
+                "details": f"Successfully accessed message history. Found {message_count} messages in sample"
+            }
+            diagnostic["success"] = True
+        except Exception as e:
+            error_str = str(e)
+            diagnostic["tests"]["message_access"] = {
+                "success": False,
+                "error": error_str,
+                "details": "Failed to access message history"
+            }
+            diagnostic["error_details"] = error_str
+
+            # Check for common error patterns
+            if "not_in_channel" in error_str:
+                diagnostic["diagnosis"] = "Bot is not a member of this private channel"
+                diagnostic["solution"] = "Manually add the bot to the private channel"
+            elif "missing_scope" in error_str:
+                diagnostic["diagnosis"] = "Bot lacks required scopes for private channels"
+                diagnostic["solution"] = "Add 'groups:read' and 'groups:history' scopes to your Slack app"
+            elif "channel_not_found" in error_str:
+                diagnostic["diagnosis"] = "Channel not found or no access"
+                diagnostic["solution"] = "Verify channel exists and bot has proper permissions"
+            elif "access_denied" in error_str or "forbidden" in error_str:
+                diagnostic["diagnosis"] = "Access denied to channel"
+                diagnostic["solution"] = "Check bot permissions and workspace admin settings"
+
+        # Test 3: Bot membership verification for private channels
+        if is_private and is_member:
+            try:
+                # Try to get channel members to verify bot is really a member
+                members_response = self.source_client._make_request(
+                    "conversations_members",
+                    channel=channel_id,
+                    limit=10
+                )
+                members = members_response.get("members", [])
+                # Get bot user ID
+                auth_response = self.source_client._make_request("auth_test")
+                bot_user_id = auth_response.get("user_id")
+
+                is_really_member = bot_user_id in members
+                diagnostic["tests"]["membership_verification"] = {
+                    "success": True,
+                    "details": f"Bot membership verified: {is_really_member}",
+                    "bot_user_id": bot_user_id,
+                    "is_really_member": is_really_member
+                }
+
+                if not is_really_member:
+                    diagnostic["diagnosis"] = "Channel metadata says bot is member, but bot is not in member list"
+                    diagnostic["solution"] = "Re-add bot to the channel or check for sync issues"
+
+            except Exception as e:
+                diagnostic["tests"]["membership_verification"] = {
+                    "success": False,
+                    "error": str(e),
+                    "details": "Could not verify bot membership"
+                }
+
+        return diagnostic
+
+    def diagnose_channel_access(self, channel_name: str) -> None:
+        """
+        Run comprehensive diagnostics on a specific channel to identify access issues
+        """
+        logger.info(f"🔍 Running diagnostics for channel #{channel_name}...")
+
+        # Get all channels to find the target channel
+        try:
+            all_channels = self.source_client.get_channels()
+        except Exception as e:
+            logger.error(f"Failed to get channels list: {e}")
+            return
+
+        target_channel = None
+        for channel in all_channels:
+            if channel.get("name") == channel_name:
+                target_channel = channel
+                break
+
+        if not target_channel:
+            logger.error(f"❌ Channel #{channel_name} not found")
+            return
+
+        # Run comprehensive tests
+        diagnostic = self._test_channel_access(target_channel)
+
+        # Print diagnostic results
+        logger.info(f"📊 Diagnostic Results for #{channel_name}:")
+        logger.info(f"   Channel ID: {diagnostic['channel_id']}")
+        logger.info(f"   Private: {diagnostic['is_private']}")
+        logger.info(f"   Bot is member: {diagnostic['is_member']}")
+        logger.info(f"   Overall Success: {diagnostic['success']}")
+
+        for test_name, test_result in diagnostic['tests'].items():
+            status = "✅" if test_result['success'] else "❌"
+            logger.info(f"   {status} {test_name}: {test_result['details']}")
+            if not test_result['success'] and 'error' in test_result:
+                logger.info(f"      Error: {test_result['error']}")
+
+        if diagnostic.get('diagnosis'):
+            logger.warning(f"🔍 Diagnosis: {diagnostic['diagnosis']}")
+            logger.info(f"💡 Suggested Solution: {diagnostic['solution']}")
+
+        if not diagnostic['success']:
+            logger.error(f"❌ Channel #{channel_name} is not accessible for download")
+        else:
+            logger.info(f"✅ Channel #{channel_name} appears accessible for download")
+
     def migrate(self, download_only: bool = False, upload_only: bool = False):
         """Run the complete migration process"""
         if upload_only:
@@ -1377,3 +1537,67 @@ class SlackMigrator:
         else:
             data = self.download_workspace_data()
             self.upload_workspace_data(data)
+
+    def _auto_join_channel(self, channel_id: str, channel_name: str, is_private: bool = False) -> bool:
+        """
+        Automatically join a channel to enable message downloading
+
+        Args:
+            channel_id: Channel ID to join
+            channel_name: Channel name for logging
+            is_private: Whether this is a private channel
+
+        Returns:
+            bool: True if successfully joined or already member, False otherwise
+        """
+        try:
+            if is_private:
+                # For private channels, we can't auto-join - need to be invited
+                logger.warning(f"Cannot auto-join private channel #{channel_name}. Bot must be manually invited.")
+                return False
+
+            # Try to join public channel
+            response = self.source_client._make_request("conversations_join", channel=channel_id)
+
+            if response.get("ok"):
+                logger.info(f"✅ Successfully joined channel #{channel_name}")
+                return True
+            else:
+                error = response.get("error", "unknown_error")
+                if error == "is_already_in_channel":
+                    logger.info(f"✅ Already member of channel #{channel_name}")
+                    return True
+                else:
+                    logger.error(f"❌ Failed to join #{channel_name}: {error}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"❌ Exception joining #{channel_name}: {e}")
+            return False
+
+    def _handle_not_in_channel_error(self, channel: Dict[str, Any]) -> bool:
+        """
+        Handle 'not_in_channel' error by attempting to join the channel
+
+        Args:
+            channel: Channel dictionary with id, name, is_private info
+
+        Returns:
+            bool: True if resolved (joined successfully), False otherwise
+        """
+        channel_id = channel["id"]
+        channel_name = channel.get("name", channel_id)
+        is_private = channel.get("is_private", False)
+
+        logger.info(f"🔄 Bot is not a member of #{channel_name}. Attempting to resolve...")
+
+        if is_private:
+            logger.warning(f"❌ Cannot access private channel #{channel_name}")
+            logger.warning(f"   Solution: Manually invite the bot to the private channel:")
+            logger.warning(f"   1. Go to #{channel_name} in Slack")
+            logger.warning(f"   2. Type: /invite @YourBotName")
+            logger.warning(f"   3. Then re-run the download command")
+            return False
+        else:
+            # Try to auto-join public channel
+            return self._auto_join_channel(channel_id, channel_name, is_private)

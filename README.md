@@ -43,16 +43,23 @@ You need to create Slack apps in both your source and destination workspaces:
 
 - `channels:read`
 - `channels:history`
+- `channels:join`
 - `groups:read`
 - `groups:history`
+- `im:read`
+- `im:history`
+- `mpim:read`
+- `mpim:history`
 - `users:read`
-- `team:read`
+- `files:read`
 
 **For Destination Workspace (writing data):**
 
 - `channels:write`
 - `channels:manage`
 - `chat:write`
+- `chat:write.public`
+- `files:write`
 - `users:read`
 - `team:read`
 

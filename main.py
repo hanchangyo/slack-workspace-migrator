@@ -541,5 +541,20 @@ def count(ctx, channel):
             click.echo(f"❌ Error getting channel counts: {e}")
             ctx.exit(1)
 
+@cli.command()
+@click.argument('channel_name')
+@click.pass_context
+def diagnose(ctx, channel_name):
+    """Diagnose access issues for a specific channel"""
+    migrator = ctx.obj['migrator']
+
+    click.echo(f"🔍 Diagnosing access to channel #{channel_name}...")
+    try:
+        migrator.diagnose_channel_access(channel_name)
+        click.echo(f"✅ Diagnostic completed. Check the log file for detailed results.")
+    except Exception as e:
+        click.echo(f"❌ Diagnostic failed: {e}")
+        ctx.exit(1)
+
 if __name__ == '__main__':
     cli()

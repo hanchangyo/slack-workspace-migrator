@@ -72,8 +72,47 @@ class SlackClient:
 
         raise Exception(f"Failed to make request {method} after {self.max_retries} attempts")
 
-    def get_channels(self, exclude_archived: bool = True) -> List[Dict[str, Any]]:
-        """Get all channels from workspace"""
+    def get_channels(self, exclude_archived: bool = False, types: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all channels from workspace
+
+        Args:
+            exclude_archived: Whether to exclude archived channels
+            types: Comma-separated list of channel types to include.
+                  Options: public_channel, private_channel, mpim, im
+                  If None, tries to get all available types based on scopes
+        """
+        channels = []
+
+        # If types specified, use them directly
+        if types is not None:
+            return self._get_channels_by_type(types, exclude_archived)
+
+        # Otherwise, try different combinations based on available scopes
+        # Start with the most comprehensive and fall back as needed
+        type_combinations = [
+            "public_channel,private_channel",          # Just channels (no DMs)
+            "public_channel"                           # Just public channels
+        ]
+
+        for types_to_try in type_combinations:
+            try:
+                logger.debug(f"Trying to fetch channels with types: {types_to_try}")
+                channels = self._get_channels_by_type(types_to_try, exclude_archived)
+                logger.info(f"Successfully fetched {len(channels)} channels with types: {types_to_try}")
+                break
+            except SlackApiError as e:
+                if e.response.get("error") == "missing_scope":
+                    needed_scope = e.response.get("needed", "unknown")
+                    logger.warning(f"Missing scope '{needed_scope}' for types '{types_to_try}', trying fallback...")
+                    continue
+                else:
+                    # Re-raise other API errors
+                    raise
+
+        return channels
+
+    def _get_channels_by_type(self, types: str, exclude_archived: bool) -> List[Dict[str, Any]]:
+        """Helper method to get channels by specific types"""
         channels = []
         cursor = None
 
@@ -81,6 +120,7 @@ class SlackClient:
             response = self._make_request(
                 "conversations_list",
                 exclude_archived=exclude_archived,
+                types=types,
                 limit=200,  # Use pagination as recommended
                 cursor=cursor
             )
@@ -226,7 +266,7 @@ class SlackClient:
         return self._make_request("conversations_invite", channel=channel_id, users=",".join(user_ids))
 
     def join_channel(self, channel_id: str) -> Dict[str, Any]:
-        """Join a channel"""
+        """Join a public channel"""
         return self._make_request("conversations_join", channel=channel_id)
 
     def set_channel_topic(self, channel_id: str, topic: str) -> Dict[str, Any]:
@@ -323,12 +363,29 @@ class SlackClient:
         """Get workspace information"""
         return self._make_request("team_info")
 
+    def get_channel_members(self, channel_id: str) -> List[str]:
+        """Get list of member IDs for a channel"""
+        members = []
+        cursor = None
+
+        while True:
+            response = self._make_request(
+                "conversations_members",
+                channel=channel_id,
+                cursor=cursor
+            )
+
+            members.extend(response["members"])
+
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        return members
+
     def add_reaction(self, channel_id: str, message_ts: str, emoji_name: str) -> Dict[str, Any]:
-        """Add a reaction to a message"""
-        return self._make_request("reactions_add",
-                                channel=channel_id,
-                                timestamp=message_ts,
-                                name=emoji_name)
+        """Add reaction to a message"""
+        return self._make_request("reactions_add", channel=channel_id, timestamp=message_ts, name=emoji_name)
 
     def get_channel_message_count_estimate(self, channel_id: str) -> Optional[int]:
         """
