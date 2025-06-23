@@ -4,6 +4,9 @@
 #all_random
 #basic
 
+# Archived channels for testing
+#daily
+#moving
 
 # Lower priority channels
 #fyi_books

@@ -408,8 +408,39 @@ class SlackClient:
         return members
 
     def add_reaction(self, channel_id: str, message_ts: str, emoji_name: str) -> Dict[str, Any]:
-        """Add reaction to a message"""
+        """Add a reaction to a message"""
         return self._make_request("reactions_add", channel=channel_id, timestamp=message_ts, name=emoji_name)
+
+    def archive_channel(self, channel_id: str) -> Dict[str, Any]:
+        """Archive a channel
+
+        Args:
+            channel_id: ID of the channel to archive
+
+        Returns:
+            API response
+
+        Note:
+            Requires channels:manage, groups:write, im:write, or mpim:write scope
+            depending on channel type
+        """
+        return self._make_request("conversations_archive", channel=channel_id)
+
+    def unarchive_channel(self, channel_id: str) -> Dict[str, Any]:
+        """Unarchive a channel
+
+        Args:
+            channel_id: ID of the channel to unarchive
+
+        Returns:
+            API response
+
+        Note:
+            Requires channels:manage, groups:write, im:write, or mpim:write scope
+            depending on channel type.
+            Bot tokens currently cannot unarchive conversations - use user token.
+        """
+        return self._make_request("conversations_unarchive", channel=channel_id)
 
     def get_channel_message_count_estimate(self, channel_id: str) -> Optional[int]:
         """

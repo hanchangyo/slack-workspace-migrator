@@ -41,6 +41,8 @@ You need to create Slack apps in both your source and destination workspaces:
 
 **For Source Workspace (reading data):**
 
+**Bot Token Scopes:**
+
 - `channels:read`
 - `channels:history`
 - `channels:join`
@@ -53,7 +55,16 @@ You need to create Slack apps in both your source and destination workspaces:
 - `users:read`
 - `files:read`
 
+**User Token Scopes (required for archive operations):**
+
+- `channels:write` or `channels:manage`
+- `groups:write`
+- `im:write`
+- `mpim:write`
+
 **For Destination Workspace (writing data):**
+
+**Bot Token Scopes:**
 
 - `channels:write`
 - `channels:manage`
@@ -66,6 +77,15 @@ You need to create Slack apps in both your source and destination workspaces:
 4. Install the apps to your workspaces
 5. Copy the Bot User OAuth Tokens
 
+**Important for Archive Downloads:**
+If you plan to download from archived channels, you'll also need a User OAuth Token:
+
+1. In your Slack app settings, go to "OAuth & Permissions"
+2. Add the required user token scopes (see scopes list above)
+3. Click "Reinstall App" if needed
+4. Copy the "User OAuth Token" (starts with `xoxp-`)
+5. Add it to your `.env` file as `SOURCE_USER_TOKEN`
+
 ### 2. Environment Configuration
 
 Create a `.env` file in the project directory:
@@ -74,6 +94,10 @@ Create a `.env` file in the project directory:
 # Slack API Tokens
 SOURCE_SLACK_TOKEN=xoxb-your-source-workspace-bot-token
 DEST_SLACK_TOKEN=xoxb-your-destination-workspace-bot-token
+
+# User token for source workspace (required for unarchiving channels)
+# Get this from your Slack app OAuth settings - User OAuth Token
+SOURCE_USER_TOKEN=xoxp-your-source-workspace-user-token
 
 # Optional: Workspace names for reference
 SOURCE_WORKSPACE_NAME=Source Company Slack
@@ -104,6 +128,42 @@ python main.py info
 ```bash
 python main.py download
 ```
+
+### Download from Specific Channels
+
+```bash
+# Download a single channel
+python main.py download --channel general
+
+# Download channels from a file list
+python main.py download --channels-file channels.txt
+
+# Enable downloading from archived channels
+python main.py download --archive-download
+
+# Download specific channels including archived ones
+python main.py download --channels-file channels.txt --archive-download
+```
+
+### Channel List File Format
+
+Create a text file with channel names (one per line):
+
+```
+# High priority channels
+#general
+#announcements
+
+# Project channels
+#project-alpha
+#project-beta
+
+# Archived channels (requires --archive-download)
+#old-project
+#archived-discussion
+```
+
+**Note**: When using `--archive-download`, archived channels will be temporarily unarchived for download, then re-archived automatically. This requires additional permissions (see Configuration section).
 
 ### Upload Data Only (from previously downloaded data)
 
@@ -184,7 +244,15 @@ migration_data/
 - Private channels require the bot to be added to the channel
 - Bot needs appropriate permissions in both workspaces
 
-### 5. Rate Limits
+### 5. Archived Channels
+
+- By default, archived channels are skipped
+- Use `--archive-download` to temporarily unarchive and download them
+- Requires a user token (SOURCE_USER_TOKEN) with scopes: `channels:write`, `groups:write`, `im:write`, `mpim:write`
+- Bot tokens cannot unarchive channels - this is a Slack API limitation
+- Channels are automatically re-archived after successful download
+
+### 6. Rate Limits
 
 - Slack has strict rate limits for API calls
 - The tool includes automatic rate limiting and retry logic
@@ -235,8 +303,15 @@ python main.py upload
    - Check logs to see which channels were skipped
 
 4. **"User mapping failed"**
+
    - Users are mapped by email address
    - Ensure users exist in destination workspace with same emails
+
+5. **"Cannot unarchive channel"**
+   - Bot tokens cannot unarchive channels (Slack API limitation)
+   - Add SOURCE_USER_TOKEN to your .env file with a user token (xoxp-...)
+   - Ensure the user token has `channels:write` and `groups:write` scopes
+   - The user must have permission to archive/unarchive channels in the workspace
 
 ### Logs
 
@@ -268,3 +343,7 @@ This project is provided as-is for educational and migration purposes. Please en
 - Use at your own risk and always test with non-production data first
 - Ensure you have proper authorization before migrating workspace data
 - Consider Slack's official migration tools for enterprise use cases
+
+```
+
+```

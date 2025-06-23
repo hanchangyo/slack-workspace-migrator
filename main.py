@@ -40,8 +40,9 @@ def cli(ctx, log_level):
 @click.option('--channel', help='Download only a specific channel (by name)')
 @click.option('--channels-file', type=click.Path(exists=True), help='Download channels listed in a file (one per line)')
 @click.option('--force', is_flag=True, help='Force re-download even if cached data exists')
+@click.option('--archive-download', is_flag=True, help='Enable downloading from archived channels by temporarily unarchiving them')
 @click.pass_context
-def download(ctx, channel, channels_file, force):
+def download(ctx, channel, channels_file, force, archive_download):
     """Download data from source Slack workspace"""
     migrator = ctx.obj['migrator']
 
@@ -83,6 +84,9 @@ def download(ctx, channel, channels_file, force):
                 click.echo(f"   {i}. #{ch}")
             click.echo()
 
+            if archive_download:
+                click.echo("📦 Archive download enabled - will temporarily unarchive archived channels")
+
             # Download channels in order
             successful_downloads = 0
             failed_downloads = 0
@@ -91,10 +95,11 @@ def download(ctx, channel, channels_file, force):
                 click.echo(f"📥 [{i}/{len(channels_to_download)}] Downloading #{channel_name}...")
 
                 try:
-                    data = migrator.download_single_channel(channel_name, force=force)
+                    data = migrator.download_single_channel(channel_name, force=force, enable_archive_download=archive_download)
                     if data:
                         from_cache = data.get('from_cache', False)
                         partial_download = data.get('partial_download', False)
+                        was_archived = data.get('was_archived', False)
 
                         if partial_download:
                             status_icon = "⚠️"
@@ -106,7 +111,8 @@ def download(ctx, channel, channels_file, force):
                             status_icon = "✅"
                             source_text = "downloaded"
 
-                        click.echo(f"   {status_icon} #{channel_name} {source_text} - {len(data.get('messages', []))} messages, {data.get('file_count', 0)} files")
+                        archive_indicator = " 📦" if was_archived else ""
+                        click.echo(f"   {status_icon} #{channel_name} {source_text} - {len(data.get('messages', []))} messages, {data.get('file_count', 0)} files{archive_indicator}")
                         successful_downloads += 1
                     else:
                         click.echo(f"   ❌ #{channel_name} not found or could not be accessed")
@@ -134,12 +140,14 @@ def download(ctx, channel, channels_file, force):
         return
 
     if channel:
-        click.echo(f"Starting download of channel #{channel} from source workspace...")
+        archive_msg = " (with archive download enabled)" if archive_download else ""
+        click.echo(f"Starting download of channel #{channel} from source workspace{archive_msg}...")
         try:
-            data = migrator.download_single_channel(channel, force=force)
+            data = migrator.download_single_channel(channel, force=force, enable_archive_download=archive_download)
             if data:
                 from_cache = data.get('from_cache', False)
                 partial_download = data.get('partial_download', False)
+                was_archived = data.get('was_archived', False)
 
                 if partial_download:
                     status_icon = "⚠️"
@@ -156,6 +164,8 @@ def download(ctx, channel, channels_file, force):
                 click.echo(f"   - Messages: {len(data.get('messages', []))}")
                 click.echo(f"   - Files: {data.get('file_count', 0)}")
                 click.echo(f"   - Total users in workspace: {data.get('total_users', 0)}")
+                if was_archived:
+                    click.echo(f"   - 📦 Channel was temporarily unarchived for download")
 
                 if from_cache:
                     click.echo("   ℹ️  Data loaded from existing files (use --force to re-download)")
@@ -171,9 +181,10 @@ def download(ctx, channel, channels_file, force):
             click.echo(f"❌ Download failed: {e}")
             ctx.exit(1)
     else:
-        click.echo("Starting download from source workspace...")
+        archive_msg = " (with archive download enabled)" if archive_download else ""
+        click.echo(f"Starting download from source workspace{archive_msg}...")
         try:
-            data = migrator.download_workspace_data(force=force)
+            data = migrator.download_workspace_data(force=force, enable_archive_download=archive_download)
             click.echo(f"✅ Download completed! Data saved to {migrator.output_dir}")
 
             # Count what was actually downloaded vs cached
@@ -185,6 +196,7 @@ def download(ctx, channel, channels_file, force):
             total_files = 0
             completed_channels = 0
             partial_channels = 0
+            archived_channels_count = 0
 
             for channel_data in data.get('messages', {}).values():
                 messages = channel_data.get('messages', [])
@@ -197,12 +209,18 @@ def download(ctx, channel, channels_file, force):
                 elif messages:  # Has some messages but not completed
                     partial_channels += 1
 
+                # Count archived channels that were downloaded
+                if channel_data.get('was_archived', False):
+                    archived_channels_count += 1
+
             click.echo(f"   - Users: {users_count}")
             click.echo(f"   - Channels: {channels_count}")
             click.echo(f"   - Message channels processed: {messages_count}")
             click.echo(f"   - Completed channels: {completed_channels}")
             if partial_channels > 0:
                 click.echo(f"   - Partial channels: {partial_channels} (can be resumed)")
+            if archived_channels_count > 0:
+                click.echo(f"   - 📦 Archived channels downloaded: {archived_channels_count}")
             click.echo(f"   - Files downloaded: {total_files}")
 
             # Show breakdown of what was skipped vs downloaded
