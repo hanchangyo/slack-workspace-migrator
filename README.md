@@ -158,23 +158,52 @@ Create a text file with channel names (one per line):
 #project-alpha
 #project-beta
 
-# Archived channels (requires --archive-download)
+# Archived channels (requires --archive-download for download)
 #old-project
 #archived-discussion
 ```
 
-**Note**: When using `--archive-download`, archived channels will be temporarily unarchived for download, then re-archived automatically. This requires additional permissions (see Configuration section).
+**Note**: The same channel list file can be used for both download and upload operations. When uploading, only channels that have been previously downloaded will be processed.
 
 ### Upload Data Only (from previously downloaded data)
 
 ```bash
+# Upload all downloaded data
 python main.py upload
+
+# Upload a specific channel
+python main.py upload --channel general
+
+# Upload channels from a file list
+python main.py upload --channels-file channels.txt
+
+# Dry run to see what would be uploaded
+python main.py upload --channels-file channels.txt --dry-run
+
+# Upload with message limit for testing
+python main.py upload --channels-file channels.txt --limit 10
 ```
 
 ### Complete Migration (download + upload)
 
 ```bash
 python main.py migrate
+```
+
+### Typical Workflow with Channel Files
+
+```bash
+# 1. Create a channel list file
+echo -e "#important\n#announcements\n#general" > my_channels.txt
+
+# 2. Download selected channels
+python main.py download --channels-file my_channels.txt
+
+# 3. Review what would be uploaded
+python main.py upload --channels-file my_channels.txt --dry-run
+
+# 4. Upload to destination workspace
+python main.py upload --channels-file my_channels.txt
 ```
 
 ### Check Migration Status
@@ -259,6 +288,19 @@ migration_data/
 - Large workspaces may take considerable time to migrate
 
 ## Advanced Usage
+
+### Selective Channel Operations
+
+```bash
+# Download specific channels in priority order
+python main.py download --channels-file priority_channels.txt
+
+# Upload the same channels in the same order
+python main.py upload --channels-file priority_channels.txt
+
+# Test upload with limited messages
+python main.py upload --channels-file priority_channels.txt --limit 10 --dry-run
+```
 
 ### Custom Output Directory
 

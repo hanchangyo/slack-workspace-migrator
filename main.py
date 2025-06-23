@@ -247,15 +247,177 @@ def download(ctx, channel, channels_file, force, archive_download):
 
 @cli.command()
 @click.option('--channel', help='Upload only a specific channel (by name)')
+@click.option('--channels-file', type=click.Path(exists=True), help='Upload channels listed in a file (one per line)')
 @click.option('--dry-run', is_flag=True, help='Show what would be uploaded without actually uploading')
 @click.option('--limit', type=int, help='Limit number of messages to upload (for testing)')
 @click.pass_context
-def upload(ctx, channel, dry_run, limit):
+def upload(ctx, channel, channels_file, dry_run, limit):
     """Upload data to destination Slack workspace"""
     migrator = ctx.obj['migrator']
 
     if dry_run:
         click.echo("🔍 Dry run mode - showing what would be uploaded...")
+
+    # Handle file input for multiple channels
+    if channels_file:
+        click.echo(f"📄 Reading channel list from: {channels_file}")
+
+        try:
+            with open(channels_file, 'r') as f:
+                channel_lines = f.readlines()
+
+            # Parse channel names, removing # prefix and whitespace
+            channels_to_upload = []
+            for line in channel_lines:
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+
+                # Skip comment lines (lines that start with ## or # followed by space)
+                if line.startswith('##') or (line.startswith('# ') and len(line) > 2):
+                    continue
+
+                if line.startswith('#'):
+                    # Handle lines that start with #channel_name
+                    channel_name = line[1:].strip()  # Remove # prefix
+                else:
+                    # Handle lines without # prefix
+                    channel_name = line.strip()
+
+                if channel_name:
+                    channels_to_upload.append(channel_name)
+
+            if not channels_to_upload:
+                click.echo("❌ No valid channel names found in file")
+                ctx.exit(1)
+
+            click.echo(f"📋 Found {len(channels_to_upload)} channels to upload:")
+            for i, ch in enumerate(channels_to_upload, 1):
+                click.echo(f"   {i}. #{ch}")
+            click.echo()
+
+            # Check if we have data for these channels
+            output_dir = Path(migrator.output_dir)
+            messages_dir = output_dir / "messages"
+
+            if not messages_dir.exists():
+                click.echo("❌ No downloaded data found. Please run download first.")
+                ctx.exit(1)
+
+            # Find available channel files and match with requested channels
+            available_channels = {}
+            for file_path in messages_dir.glob("*.json"):
+                channel_name = file_path.stem.split('_')[0]
+                available_channels[channel_name] = file_path
+
+            # Validate that we have data for all requested channels
+            missing_channels = []
+            valid_channels = []
+            for channel_name in channels_to_upload:
+                if channel_name in available_channels:
+                    valid_channels.append((channel_name, available_channels[channel_name]))
+                else:
+                    missing_channels.append(channel_name)
+
+            if missing_channels:
+                click.echo(f"❌ Missing data for {len(missing_channels)} channels:")
+                for ch in missing_channels:
+                    click.echo(f"   - #{ch}")
+                click.echo(f"\nAvailable channels:")
+                for ch in sorted(available_channels.keys()):
+                    click.echo(f"   - #{ch}")
+                ctx.exit(1)
+
+            if dry_run:
+                # Show what would be uploaded
+                total_messages = 0
+                total_files = 0
+
+                for channel_name, file_path in valid_channels:
+                    try:
+                        with open(file_path, 'r') as f:
+                            channel_data = json.load(f)
+                        messages = channel_data.get("messages", [])
+                        if limit and limit > 0:
+                            messages = messages[:limit]
+
+                        files_count = sum(len(msg.get("files", [])) for msg in messages)
+                        total_messages += len(messages)
+                        total_files += files_count
+
+                        click.echo(f"   📋 #{channel_name}: {len(messages)} messages, {files_count} files")
+                    except Exception as e:
+                        click.echo(f"   ❌ #{channel_name}: Error reading data - {e}")
+
+                click.echo(f"\n📊 Total would upload:")
+                click.echo(f"   - Channels: {len(valid_channels)}")
+                click.echo(f"   - Messages: {total_messages}")
+                click.echo(f"   - Files: {total_files}")
+                if limit:
+                    click.echo(f"   - Limit applied: {limit} messages per channel")
+                return
+
+            # Upload channels in order
+            successful_uploads = 0
+            failed_uploads = 0
+
+            click.echo(f"📤 Starting batch upload of {len(valid_channels)} channels...")
+            if limit:
+                click.echo(f"   ⚠️  Limited to {limit} messages per channel for testing")
+
+            for i, (channel_name, file_path) in enumerate(valid_channels, 1):
+                click.echo(f"📤 [{i}/{len(valid_channels)}] Uploading #{channel_name}...")
+
+                try:
+                    # Load channel data
+                    with open(file_path, 'r') as f:
+                        channel_data = json.load(f)
+
+                    messages = channel_data.get("messages", [])
+
+                    # Apply limit if specified
+                    if limit and limit > 0:
+                        messages = messages[:limit]
+
+                    files_count = sum(len(msg.get("files", [])) for msg in messages)
+
+                    if not messages:
+                        click.echo(f"   ⚠️  #{channel_name} has no messages to upload")
+                        continue
+
+                    # Create upload data structure for single channel
+                    limited_channel_data = channel_data.copy()
+                    limited_channel_data["messages"] = messages
+
+                    upload_data = {
+                        "messages": {channel_data["channel_info"]["id"]: limited_channel_data}
+                    }
+
+                    # Perform the upload
+                    migrator.upload_workspace_data(upload_data)
+
+                    click.echo(f"   ✅ #{channel_name} uploaded - {len(messages)} messages, {files_count} files")
+                    successful_uploads += 1
+
+                except KeyboardInterrupt:
+                    click.echo(f"\n⚠️  Upload interrupted at channel #{channel_name}")
+                    click.echo(f"   Completed: {successful_uploads}/{len(valid_channels)} channels")
+                    ctx.exit(0)
+                except Exception as e:
+                    click.echo(f"   ❌ #{channel_name} failed: {e}")
+                    failed_uploads += 1
+
+            # Summary
+            click.echo(f"\n🎯 Batch upload complete!")
+            click.echo(f"   ✅ Successful: {successful_uploads}")
+            if failed_uploads > 0:
+                click.echo(f"   ❌ Failed: {failed_uploads}")
+
+        except Exception as e:
+            click.echo(f"❌ Error reading channels file: {e}")
+            ctx.exit(1)
+
+        return
 
     if channel:
         click.echo(f"Starting upload of channel #{channel} to destination workspace...")
