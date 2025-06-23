@@ -4,6 +4,12 @@
 Simple script to list channel names and IDs
 """
 
+import sys
+import os
+
+# Add parent directory to path so we can import from the main project
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from config import get_config
 from slack_client import SlackClient
 
