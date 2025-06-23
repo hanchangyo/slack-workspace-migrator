@@ -38,11 +38,100 @@ def cli(ctx, log_level):
 
 @cli.command()
 @click.option('--channel', help='Download only a specific channel (by name)')
+@click.option('--channels-file', type=click.Path(exists=True), help='Download channels listed in a file (one per line)')
 @click.option('--force', is_flag=True, help='Force re-download even if cached data exists')
 @click.pass_context
-def download(ctx, channel, force):
+def download(ctx, channel, channels_file, force):
     """Download data from source Slack workspace"""
     migrator = ctx.obj['migrator']
+
+    # Handle file input for multiple channels
+    if channels_file:
+        click.echo(f"📄 Reading channel list from: {channels_file}")
+
+        try:
+            with open(channels_file, 'r') as f:
+                channel_lines = f.readlines()
+
+            # Parse channel names, removing # prefix and whitespace
+            channels_to_download = []
+            for line in channel_lines:
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+
+                # Skip comment lines (lines that start with ## or # followed by space)
+                if line.startswith('##') or (line.startswith('# ') and len(line) > 2):
+                    continue
+
+                if line.startswith('#'):
+                    # Handle lines that start with #channel_name
+                    channel_name = line[1:].strip()  # Remove # prefix
+                else:
+                    # Handle lines without # prefix
+                    channel_name = line.strip()
+
+                if channel_name:
+                    channels_to_download.append(channel_name)
+
+            if not channels_to_download:
+                click.echo("❌ No valid channel names found in file")
+                ctx.exit(1)
+
+            click.echo(f"📋 Found {len(channels_to_download)} channels to download:")
+            for i, ch in enumerate(channels_to_download, 1):
+                click.echo(f"   {i}. #{ch}")
+            click.echo()
+
+            # Download channels in order
+            successful_downloads = 0
+            failed_downloads = 0
+
+            for i, channel_name in enumerate(channels_to_download, 1):
+                click.echo(f"📥 [{i}/{len(channels_to_download)}] Downloading #{channel_name}...")
+
+                try:
+                    data = migrator.download_single_channel(channel_name, force=force)
+                    if data:
+                        from_cache = data.get('from_cache', False)
+                        partial_download = data.get('partial_download', False)
+
+                        if partial_download:
+                            status_icon = "⚠️"
+                            source_text = "partially downloaded (interrupted)"
+                        elif from_cache:
+                            status_icon = "📁"
+                            source_text = "from cache"
+                        else:
+                            status_icon = "✅"
+                            source_text = "downloaded"
+
+                        click.echo(f"   {status_icon} #{channel_name} {source_text} - {len(data.get('messages', []))} messages, {data.get('file_count', 0)} files")
+                        successful_downloads += 1
+                    else:
+                        click.echo(f"   ❌ #{channel_name} not found or could not be accessed")
+                        failed_downloads += 1
+
+                except KeyboardInterrupt:
+                    click.echo(f"\n⚠️  Download interrupted at channel #{channel_name}")
+                    click.echo(f"   Completed: {successful_downloads}/{len(channels_to_download)} channels")
+                    click.echo("   Run the command again to resume from where it left off.")
+                    ctx.exit(0)
+                except Exception as e:
+                    click.echo(f"   ❌ #{channel_name} failed: {e}")
+                    failed_downloads += 1
+
+            # Summary
+            click.echo(f"\n🎯 Batch download complete!")
+            click.echo(f"   ✅ Successful: {successful_downloads}")
+            if failed_downloads > 0:
+                click.echo(f"   ❌ Failed: {failed_downloads}")
+
+        except Exception as e:
+            click.echo(f"❌ Error reading channels file: {e}")
+            ctx.exit(1)
+
+        return
 
     if channel:
         click.echo(f"Starting download of channel #{channel} from source workspace...")

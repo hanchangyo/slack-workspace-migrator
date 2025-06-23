@@ -1,0 +1,9 @@
+# High priority channels (download first)
+#all_general
+#all_moving
+#all_random
+#basic
+
+
+# Lower priority channels
+#fyi_books
