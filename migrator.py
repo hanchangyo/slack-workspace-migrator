@@ -11,6 +11,7 @@ import time
 from urllib.parse import urlparse
 
 from slack_client import SlackClient
+from slack_sdk.errors import SlackApiError
 from config import SlackConfig
 
 logger = logging.getLogger(__name__)
