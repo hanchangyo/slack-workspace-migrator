@@ -306,7 +306,19 @@ class SlackMigrator:
         updated_files = []
 
         for file_info in files:
-            # Download the file
+            # Check if file is already downloaded and still exists
+            if (file_info.get("local_path") and
+                file_info.get("download_status") == "success" and
+                Path(file_info["local_path"]).exists()):
+
+                # File already downloaded and verified - skip download
+                updated_file_info = file_info.copy()
+                updated_file_info["_was_already_downloaded"] = True  # Temporary flag for counting
+                logger.debug(f"Skipping already downloaded file: {file_info.get('name', 'unknown')}")
+                updated_files.append(updated_file_info)
+                continue
+
+            # Download the file (either new or needs re-download)
             local_path = self._download_file(file_info, channel_name)
 
             # Create updated file info
@@ -333,40 +345,72 @@ class SlackMigrator:
         if not messages:
             return messages
 
-        # Count files first
+        # Count files that need downloading (skip already downloaded files)
         total_files = 0
+        files_already_downloaded = 0
+
         for message in messages:
             if "files" in message and message["files"]:
-                total_files += len(message["files"])
+                for file_info in message["files"]:
+                    if file_info.get("local_path") and file_info.get("download_status") == "success":
+                        # File already downloaded - verify it still exists
+                        if Path(file_info["local_path"]).exists():
+                            files_already_downloaded += 1
+                            continue
+                        else:
+                            # File was downloaded before but no longer exists - needs re-download
+                            file_info.pop("local_path", None)
+                            file_info.pop("download_status", None)
+                    total_files += 1
 
-        if total_files == 0:
+        if total_files == 0 and files_already_downloaded == 0:
             return messages
 
-        logger.info(f"Found {total_files} files to download from #{channel_name}")
+        if files_already_downloaded > 0:
+            logger.info(f"Found {files_already_downloaded} already downloaded files, {total_files} files need downloading from #{channel_name}")
+        else:
+            logger.info(f"Found {total_files} files to download from #{channel_name}")
+
+        if total_files == 0:
+            logger.info(f"All files already downloaded for #{channel_name}, skipping file download phase")
+            return messages
 
         updated_messages = []
         downloaded_count = 0
         failed_count = 0
+        skipped_count = 0
 
         with tqdm(total=total_files, desc=f"Downloading files from #{channel_name}") as pbar:
             for message in messages:
                 if "files" in message and message["files"]:
-                    # Process message files
+                    # Process message files, but skip already downloaded ones
                     updated_message = self._process_message_files(message, channel_name)
 
                     # Count results
                     for file_info in updated_message.get("files", []):
                         if file_info.get("download_status") == "success":
-                            downloaded_count += 1
-                        else:
+                            if file_info.get("_was_already_downloaded"):
+                                skipped_count += 1
+                                # Don't update progress bar for skipped files
+                                file_info.pop("_was_already_downloaded", None)  # Clean up temp flag
+                            else:
+                                downloaded_count += 1
+                                pbar.update(1)
+                        elif file_info.get("download_status") == "failed":
                             failed_count += 1
-                        pbar.update(1)
+                            pbar.update(1)
 
                     updated_messages.append(updated_message)
                 else:
                     updated_messages.append(message)
 
-        logger.info(f"File download completed for #{channel_name}: {downloaded_count} successful, {failed_count} failed")
+        summary_parts = [f"{downloaded_count} successful"]
+        if failed_count > 0:
+            summary_parts.append(f"{failed_count} failed")
+        if skipped_count > 0:
+            summary_parts.append(f"{skipped_count} already downloaded")
+
+        logger.info(f"File download completed for #{channel_name}: {', '.join(summary_parts)}")
         return updated_messages
 
     def _download_workspace_info(self, force: bool = False) -> Optional[Dict[str, Any]]:
@@ -588,7 +632,26 @@ class SlackMigrator:
         if file_path.exists():
             try:
                 with open(file_path, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
+
+                    # Populate downloaded_files cache from existing message data to prevent re-downloads
+                    messages = data.get("messages", [])
+                    for message in messages:
+                        for file_info in message.get("files", []):
+                            file_id = file_info.get("id")
+                            local_path = file_info.get("local_path")
+                            if file_id and local_path and file_info.get("download_status") == "success":
+                                # Verify file still exists on disk
+                                if Path(local_path).exists():
+                                    self.downloaded_files[file_id] = local_path
+                                    logger.debug(f"Restored file cache entry: {file_id} -> {local_path}")
+                                else:
+                                    logger.warning(f"Previously downloaded file missing: {local_path}")
+
+                    if self.downloaded_files:
+                        logger.info(f"Restored {len(self.downloaded_files)} file download entries from cache")
+
+                    return data
             except Exception as e:
                 logger.warning(f"Could not load existing channel data: {e}")
 
