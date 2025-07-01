@@ -41,10 +41,16 @@ def cli(ctx, log_level):
 @click.option('--channels-file', type=click.Path(exists=True), help='Download channels listed in a file (one per line)')
 @click.option('--force', is_flag=True, help='Force re-download even if cached data exists')
 @click.option('--archive-download', is_flag=True, help='Enable downloading from archived channels by temporarily unarchiving them')
+@click.option('--update', is_flag=True, help='Check for and download new messages from completed channels')
 @click.pass_context
-def download(ctx, channel, channels_file, force, archive_download):
+def download(ctx, channel, channels_file, force, archive_download, update):
     """Download data from source Slack workspace"""
     migrator = ctx.obj['migrator']
+
+    # Validate conflicting options
+    if force and update:
+        click.echo("❌ Cannot use --force and --update together. Use --force to completely re-download or --update to check for new messages.")
+        ctx.exit(1)
 
     # Handle file input for multiple channels
     if channels_file:
@@ -95,13 +101,26 @@ def download(ctx, channel, channels_file, force, archive_download):
                 click.echo(f"📥 [{i}/{len(channels_to_download)}] Downloading #{channel_name}...")
 
                 try:
-                    data = migrator.download_single_channel(channel_name, force=force, enable_archive_download=archive_download)
+                    data = migrator.download_single_channel(channel_name, force=force, enable_archive_download=archive_download, update=update)
                     if data:
                         from_cache = data.get('from_cache', False)
                         partial_download = data.get('partial_download', False)
                         was_archived = data.get('was_archived', False)
+                        up_to_date = data.get('up_to_date', False)
+                        updated = data.get('updated', False)
+                        new_messages_count = data.get('new_messages_count', 0)
+                        update_failed = data.get('update_failed', False)
 
-                        if partial_download:
+                        if update_failed:
+                            status_icon = "⚠️"
+                            source_text = "update check failed, using cache"
+                        elif up_to_date:
+                            status_icon = "✅"
+                            source_text = "up to date"
+                        elif updated:
+                            status_icon = "🔄"
+                            source_text = f"updated with {new_messages_count} new messages"
+                        elif partial_download:
                             status_icon = "⚠️"
                             source_text = "partially downloaded (interrupted)"
                         elif from_cache:
@@ -143,13 +162,26 @@ def download(ctx, channel, channels_file, force, archive_download):
         archive_msg = " (with archive download enabled)" if archive_download else ""
         click.echo(f"Starting download of channel #{channel} from source workspace{archive_msg}...")
         try:
-            data = migrator.download_single_channel(channel, force=force, enable_archive_download=archive_download)
+            data = migrator.download_single_channel(channel, force=force, enable_archive_download=archive_download, update=update)
             if data:
                 from_cache = data.get('from_cache', False)
                 partial_download = data.get('partial_download', False)
                 was_archived = data.get('was_archived', False)
+                up_to_date = data.get('up_to_date', False)
+                updated = data.get('updated', False)
+                new_messages_count = data.get('new_messages_count', 0)
+                update_failed = data.get('update_failed', False)
 
-                if partial_download:
+                if update_failed:
+                    status_icon = "⚠️"
+                    source_text = "update check failed, using cache"
+                elif up_to_date:
+                    status_icon = "✅"
+                    source_text = "up to date"
+                elif updated:
+                    status_icon = "🔄"
+                    source_text = f"updated with {new_messages_count} new messages"
+                elif partial_download:
                     status_icon = "⚠️"
                     source_text = "partially downloaded (interrupted)"
                 elif from_cache:
@@ -167,8 +199,14 @@ def download(ctx, channel, channels_file, force, archive_download):
                 if was_archived:
                     click.echo(f"   - 📦 Channel was temporarily unarchived for download")
 
-                if from_cache:
-                    click.echo("   ℹ️  Data loaded from existing files (use --force to re-download)")
+                if update_failed:
+                    click.echo("   ⚠️  Update check failed, showing cached data (try --force to re-download)")
+                elif up_to_date:
+                    click.echo("   ✅ Channel is up to date - no new messages found")
+                elif updated:
+                    click.echo(f"   🔄 Channel updated with {new_messages_count} new messages")
+                elif from_cache:
+                    click.echo("   ℹ️  Data loaded from existing files (use --force to re-download or --update to check for new messages)")
                 elif partial_download:
                     click.echo("   ⚠️  Download was interrupted. Run again to resume from where it left off.")
             else:

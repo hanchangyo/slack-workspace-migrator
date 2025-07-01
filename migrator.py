@@ -714,13 +714,14 @@ class SlackMigrator:
 
         return None
 
-    def download_single_channel(self, channel_name: str, force: bool = False, enable_archive_download: bool = False) -> Optional[Dict[str, Any]]:
+    def download_single_channel(self, channel_name: str, force: bool = False, enable_archive_download: bool = False, update: bool = False) -> Optional[Dict[str, Any]]:
         """Download data from a single channel by name with incremental saving
 
         Args:
             channel_name: Name of the channel to download
             force: Force re-download even if cached data exists
             enable_archive_download: Enable downloading from archived channels by temporarily unarchiving them
+            update: Check for and download new messages from completed channels
         """
         logger.info(f"Starting single channel download for #{channel_name}...")
 
@@ -784,19 +785,124 @@ class SlackMigrator:
             # Load existing data to check what we already have
             existing_data = self._load_existing_channel_data(channel_name, channel_id)
 
-            # Check if download was already completed and we're not forcing
+            # Check if download was already completed and handle based on mode
             if not force and existing_data.get("download_completed", False):
-                logger.info(f"Channel #{channel_name} download already completed, loading from file")
-                messages = existing_data.get("messages", [])
-                file_count = sum(len(msg.get("files", [])) for msg in messages)
+                if not update:
+                    # Standard behavior: return cached data
+                    logger.info(f"Channel #{channel_name} download already completed, loading from file")
+                    messages = existing_data.get("messages", [])
+                    file_count = sum(len(msg.get("files", [])) for msg in messages)
 
-                return {
-                    "channel_info": target_channel,
-                    "messages": messages,
-                    "total_users": len(users),
-                    "file_count": file_count,
-                    "from_cache": True
-                }
+                    return {
+                        "channel_info": target_channel,
+                        "messages": messages,
+                        "total_users": len(users),
+                        "file_count": file_count,
+                        "from_cache": True
+                    }
+                else:
+                    # Update mode: check for new messages since last download
+                    logger.info(f"Channel #{channel_name} download completed, checking for new messages...")
+
+                    # Get the latest message timestamp from existing data
+                    latest_timestamp = self._get_last_message_timestamp(channel_name, channel_id)
+                    if not latest_timestamp:
+                        logger.warning(f"No existing messages found for #{channel_name}, falling back to full download")
+                        # Fall through to normal download logic
+                    else:
+                        # Check for new messages after the latest timestamp
+                        try:
+                            logger.info(f"Checking for messages newer than {latest_timestamp}")
+                            new_messages = self.source_client.get_channel_messages(
+                                channel_id,
+                                oldest=latest_timestamp,
+                                include_thread_replies=True
+                            )
+
+                            # Filter out the message we already have (same timestamp)
+                            truly_new_messages = [msg for msg in new_messages if msg.get("ts") != latest_timestamp]
+
+                            if not truly_new_messages:
+                                logger.info(f"✅ Channel #{channel_name} is up to date - no new messages found")
+                                messages = existing_data.get("messages", [])
+                                file_count = sum(len(msg.get("files", [])) for msg in messages)
+
+                                return {
+                                    "channel_info": target_channel,
+                                    "messages": messages,
+                                    "total_users": len(users),
+                                    "file_count": file_count,
+                                    "from_cache": True,
+                                    "up_to_date": True
+                                }
+                            else:
+                                logger.info(f"📥 Found {len(truly_new_messages)} new messages in #{channel_name}")
+
+                                # Save the new messages incrementally
+                                self._save_incremental_messages(channel_name, channel_id, truly_new_messages, target_channel, is_complete=False)
+
+                                # Get all messages (existing + new) and process files
+                                all_messages = self._load_existing_channel_data(channel_name, channel_id).get("messages", [])
+
+                                # Download files only from new messages to avoid re-processing
+                                new_messages_with_files = self._download_channel_files(truly_new_messages, channel_name)
+
+                                # Update the new messages in the full dataset
+                                new_message_timestamps = {msg.get("ts") for msg in truly_new_messages}
+                                updated_all_messages = []
+
+                                # Add existing messages
+                                for msg in all_messages:
+                                    if msg.get("ts") not in new_message_timestamps:
+                                        updated_all_messages.append(msg)
+
+                                # Add new messages with files processed
+                                updated_all_messages.extend(new_messages_with_files)
+
+                                # Sort by timestamp
+                                updated_all_messages.sort(key=lambda x: float(x.get("ts", 0)))
+
+                                # Final save with updated completion info
+                                final_save_data = {
+                                    "channel_info": target_channel,
+                                    "messages": updated_all_messages,
+                                    "download_timestamp": datetime.now().isoformat(),
+                                    "files_downloaded": True,
+                                    "download_completed": True,
+                                    "from_cache": False,
+                                    "partial_download": False,
+                                    "was_archived": is_archived,
+                                    "last_update": datetime.now().isoformat(),
+                                    "new_messages_count": len(truly_new_messages)
+                                }
+                                self._save_incremental_messages(channel_name, channel_id, [], final_save_data)
+
+                                logger.info(f"✅ Updated #{channel_name} with {len(truly_new_messages)} new messages")
+
+                                return {
+                                    "channel_info": target_channel,
+                                    "messages": updated_all_messages,
+                                    "total_users": len(users),
+                                    "file_count": sum(len(msg.get("files", [])) for msg in updated_all_messages),
+                                    "from_cache": False,
+                                    "updated": True,
+                                    "new_messages_count": len(truly_new_messages)
+                                }
+
+                        except Exception as e:
+                            logger.error(f"❌ Error checking for new messages in #{channel_name}: {e}")
+                            logger.info("Falling back to returning cached data")
+                            messages = existing_data.get("messages", [])
+                            file_count = sum(len(msg.get("files", [])) for msg in messages)
+
+                            return {
+                                "channel_info": target_channel,
+                                "messages": messages,
+                                "total_users": len(users),
+                                "file_count": file_count,
+                                "from_cache": True,
+                                "update_failed": True
+                            }
 
             # Check if channel is accessible (after potential unarchiving)
             is_accessible, reason = self._is_channel_accessible(target_channel)
