@@ -307,7 +307,28 @@ def upload(ctx, channel, channels_file, dry_run, limit):
             # Find available channel files and match with requested channels
             available_channels = {}
             for file_path in messages_dir.glob("*.json"):
-                channel_name = file_path.stem.split('_')[0]
+                # Channel files are named: {channel_name}_{channel_id}.json
+                # We need to extract channel_name by removing the channel_id suffix
+                filename_without_ext = file_path.stem
+
+                # Split by underscore and find the channel ID (last part starting with 'C')
+                parts = filename_without_ext.split('_')
+                if len(parts) >= 2:
+                    # Last part should be the channel ID (starts with 'C')
+                    potential_channel_id = parts[-1]
+                    if (potential_channel_id.startswith('C') and
+                        len(potential_channel_id) >= 9 and
+                        potential_channel_id.isupper() and
+                        potential_channel_id.isalnum()):
+                        # Channel ID found, reconstruct channel name from remaining parts
+                        channel_name = '_'.join(parts[:-1])
+                    else:
+                        # Fallback: use original logic if pattern doesn't match
+                        channel_name = parts[0]
+                else:
+                    # Single part filename, use as-is
+                    channel_name = filename_without_ext
+
                 available_channels[channel_name] = file_path
 
             # Validate that we have data for all requested channels
@@ -440,7 +461,28 @@ def upload(ctx, channel, channels_file, dry_run, limit):
             click.echo(f"❌ No data found for channel #{channel}")
             click.echo("Available channels:")
             for file_path in messages_dir.glob("*.json"):
-                channel_name = file_path.stem.split('_')[0]
+                # Channel files are named: {channel_name}_{channel_id}.json
+                # We need to extract channel_name by removing the channel_id suffix
+                filename_without_ext = file_path.stem
+
+                # Split by underscore and find the channel ID (last part starting with 'C')
+                parts = filename_without_ext.split('_')
+                if len(parts) >= 2:
+                    # Last part should be the channel ID (starts with 'C')
+                    potential_channel_id = parts[-1]
+                    if (potential_channel_id.startswith('C') and
+                        len(potential_channel_id) >= 9 and
+                        potential_channel_id.isupper() and
+                        potential_channel_id.isalnum()):
+                        # Channel ID found, reconstruct channel name from remaining parts
+                        channel_name = '_'.join(parts[:-1])
+                    else:
+                        # Fallback: use original logic if pattern doesn't match
+                        channel_name = parts[0]
+                else:
+                    # Single part filename, use as-is
+                    channel_name = filename_without_ext
+
                 click.echo(f"  - {channel_name}")
             ctx.exit(1)
 
