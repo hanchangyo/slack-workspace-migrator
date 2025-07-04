@@ -39,11 +39,26 @@ def fix_channel_file(file_path: Path) -> bool:
 
             # Create backup
             backup_path = file_path.with_suffix('.json.backup')
-            shutil.copy2(file_path, backup_path)
-            print(f"   📋 Created backup: {backup_path.name}")
+            if not backup_path.exists():  # Don't overwrite existing backups
+                shutil.copy2(file_path, backup_path)
+                print(f"   📋 Created backup: {backup_path.name}")
+            else:
+                print(f"   📋 Using existing backup: {backup_path.name}")
 
-            # Fix the structure by unwrapping
-            data["channel_info"] = channel_info["channel_info"]
+            # CRITICAL FIX: Only unwrap the channel_info, preserve all other data
+            # The issue was: data["channel_info"] = channel_info["channel_info"]
+            # This was replacing the entire data structure instead of just fixing channel_info
+
+            # Correct approach: Extract the inner channel_info and preserve everything else
+            inner_channel_info = channel_info["channel_info"]
+            data["channel_info"] = inner_channel_info
+
+            # Verify we still have important data
+            messages_count = len(data.get("messages", []))
+            files_downloaded = data.get("files_downloaded", False)
+            download_completed = data.get("download_completed", False)
+
+            print(f"   📊 Preserving: {messages_count} messages, files_downloaded={files_downloaded}, download_completed={download_completed}")
 
             # Write the fixed file
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -59,10 +74,48 @@ def fix_channel_file(file_path: Path) -> bool:
         print(f"   ❌ Error processing {file_path.name}: {e}")
         return False
 
+def restore_from_backup(file_path: Path) -> bool:
+    """Restore a file from its backup if backup exists"""
+    backup_path = file_path.with_suffix('.json.backup')
+    if backup_path.exists():
+        print(f"🔄 Restoring {file_path.name} from backup...")
+        shutil.copy2(backup_path, file_path)
+        print(f"   ✅ Restored from {backup_path.name}")
+        return True
+    else:
+        print(f"   ❌ No backup found for {file_path.name}")
+        return False
+
 def main():
     """Main function to fix all channel files"""
     # Default to migration_data/messages directory
     messages_dir = Path("migration_data") / "messages"
+
+    # Check for restore command
+    if len(sys.argv) > 1 and sys.argv[1] == "--restore":
+        print("🔄 RESTORE MODE: Restoring all files from backups")
+        print()
+
+        if not messages_dir.exists():
+            print(f"❌ Messages directory not found: {messages_dir}")
+            sys.exit(1)
+
+        # Find all backup files
+        backup_files = list(messages_dir.glob("*.json.backup"))
+        if not backup_files:
+            print("❌ No backup files found")
+            sys.exit(1)
+
+        print(f"📁 Found {len(backup_files)} backup files")
+
+        restored_count = 0
+        for backup_path in backup_files:
+            original_path = backup_path.with_suffix('')  # Remove .backup extension
+            if restore_from_backup(original_path):
+                restored_count += 1
+
+        print(f"\n🎯 Restored {restored_count} files from backups")
+        return
 
     # Allow custom directory as command line argument
     if len(sys.argv) > 1:
@@ -71,6 +124,7 @@ def main():
     if not messages_dir.exists():
         print(f"❌ Messages directory not found: {messages_dir}")
         print("Usage: python fix_double_wrapped_channels.py [messages_directory]")
+        print("       python fix_double_wrapped_channels.py --restore")
         print("Example: python fix_double_wrapped_channels.py migration_data/messages")
         sys.exit(1)
 
@@ -105,6 +159,9 @@ def main():
         print("✅ Double-wrapping issue has been fixed!")
         print("📋 Backup files created with .backup extension")
         print("🚀 You can now retry the upload operation")
+        print()
+        print("💡 If something went wrong, restore with:")
+        print("   python tools/fix_double_wrapped_channels.py --restore")
     else:
         print()
         print("ℹ️  No files needed fixing - all structures are correct")
