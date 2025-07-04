@@ -7,17 +7,67 @@ import json
 from config import get_config
 from migrator import SlackMigrator
 
+logger = logging.getLogger(__name__)
+
 def setup_logging(log_level: str):
     """Setup logging configuration"""
-    level = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('slack_migrator.log'),
-            logging.StreamHandler()
-        ]
+        level=getattr(logging, log_level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+
+def normalize_channel_data(channel_data):
+    """
+    Normalize channel data to handle both single-wrapped and double-wrapped structures.
+
+    Single-wrapped (normal):
+    {
+        "channel_info": {"id": "...", "name": "...", ...},
+        "messages": [...],
+        ...
+    }
+
+    Double-wrapped (needs unwrapping):
+    {
+        "channel_info": {
+            "channel_info": {"id": "...", "name": "...", ...},
+            "messages": [...],
+            ...
+        },
+        ...
+    }
+
+    Returns normalized single-wrapped structure.
+    """
+    # Check if this is double-wrapped by looking for nested channel_info
+    if ("channel_info" in channel_data and
+        isinstance(channel_data["channel_info"], dict) and
+        "channel_info" in channel_data["channel_info"]):
+
+        logger.info("Detected double-wrapped channel data, unwrapping...")
+
+        # Extract the inner structure
+        inner_data = channel_data["channel_info"]
+
+        # Create normalized structure with the inner data at the top level
+        normalized = {
+            "channel_info": inner_data["channel_info"],
+            "messages": inner_data.get("messages", []),
+            # Preserve other metadata from either level
+            "download_timestamp": inner_data.get("download_timestamp") or channel_data.get("download_timestamp"),
+            "files_downloaded": inner_data.get("files_downloaded", channel_data.get("files_downloaded", False)),
+            "download_completed": inner_data.get("download_completed", channel_data.get("download_completed", False)),
+            "last_update_timestamp": inner_data.get("last_update_timestamp") or channel_data.get("last_update_timestamp"),
+            "was_archived": inner_data.get("was_archived", channel_data.get("was_archived", False)),
+            "from_cache": inner_data.get("from_cache", channel_data.get("from_cache", False)),
+            "partial_download": inner_data.get("partial_download", channel_data.get("partial_download", False))
+        }
+
+        return normalized
+    else:
+        # Already single-wrapped, return as-is
+        logger.debug("Channel data is already in single-wrapped format")
+        return channel_data
 
 @click.group()
 @click.option('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
@@ -396,7 +446,13 @@ def upload(ctx, channel, channels_file, dry_run, limit):
                     try:
                         with open(file_path, 'r') as f:
                             channel_data = json.load(f)
+
+                        # Normalize the channel data structure
+                        channel_data = normalize_channel_data(channel_data)
+
                         messages = channel_data.get("messages", [])
+
+                        # Apply limit if specified
                         if limit and limit > 0:
                             messages = messages[:limit]
 
@@ -432,11 +488,15 @@ def upload(ctx, channel, channels_file, dry_run, limit):
                     with open(file_path, 'r') as f:
                         channel_data = json.load(f)
 
+                    # Normalize the channel data structure
+                    channel_data = normalize_channel_data(channel_data)
+
                     messages = channel_data.get("messages", [])
 
                     # Apply limit if specified
                     if limit and limit > 0:
                         messages = messages[:limit]
+                        click.echo(f"ℹ️  Limited to first {limit} messages for testing")
 
                     files_count = sum(len(msg.get("files", [])) for msg in messages)
 
@@ -528,6 +588,9 @@ def upload(ctx, channel, channels_file, dry_run, limit):
         try:
             with open(channel_file, 'r') as f:
                 channel_data = json.load(f)
+
+            # Normalize the channel data structure
+            channel_data = normalize_channel_data(channel_data)
 
             messages = channel_data.get("messages", [])
 
